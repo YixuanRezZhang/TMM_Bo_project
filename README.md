@@ -6,6 +6,11 @@ A modular framework for Bayesian optimization with various sampling and acquisit
 
 Clone the repository and navigate to the project directory:
 
+install via:
+- conda: 'conda env create -f environment.yml'
+- pip: 'pip install -r requirements.txt' or 'pip install -e .'
+
+
 ## To Do list
 
 - multi-task and multi-fidelity implementation

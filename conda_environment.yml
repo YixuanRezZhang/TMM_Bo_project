@@ -1,0 +1,19 @@
+name: Bo_project
+channels:
+  - conda-forge
+dependencies:
+  - numpy
+  - pandas
+  - scikit-learn
+  - optuna
+  - xgboost
+  - lightgbm
+  - pytorch
+  - botorch
+  - gpytorch
+  - pygmo
+  - matplotlib
+  - pip
+  - pip:
+      - scikit-opt
+      - ray

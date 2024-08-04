@@ -42,12 +42,24 @@ class AcquisitionFunction:
         
         return contri_rank + distances
 
-    def select_next(self, method, X_candidate, model_name_list, num_target, model_path, batch_size=10, y_best=None, model_result=None):
+    def select_next(self, method, X_candidate, model_name_list, num_target, model_path, batch_size=10, y_best=None, model_result=None, stack=False):
 
         all_acq_vaules = []
-        
+               
         # Load models
         for target_i in range(num_target):
+            
+            if stack:
+                if model_result is None:
+                    stack_file_path = f"{model_path}/stacking_results_{target_i}.pkl"
+                    with open(stack_file_path, 'rb') as f:
+                        data = pickle.load(f)
+                    stacking_model = data['stacking_model']
+                    stacking_score = data['stacking_error']
+                else:
+                    stacking_model = model_result[target_i]['stacking_model']
+                    stacking_score = model_result[target_i]['stacking_error']
+                    
             acq_values = np.zeros(X_candidate.shape[0])
             for sg_model in model_name_list:
 
@@ -59,16 +71,19 @@ class AcquisitionFunction:
                     # model_name = data['model_name']
                     # optimized_params = data['optimized_params']
                     models = data['models']
-                    model_errors = data['model_errors']
+                    model_errors = data['errors']
                 else:
-                    models = model_result[target_i][sg_model]['model']
-                    model_errors = model_result[target_i][sg_model]['error']
+                    models = model_result[target_i][sg_model]['models']
+                    model_errors = model_result[target_i][sg_model]['errors']
 
-                # design of score can be discussed.  
+                # design of score can be discussed. 
                 ### TBD:***maybe using a model ensemble score to direct represent score, thus a ensemble fitting should be added in evaluation.py***
-                score_mu, score_std = np.mean(model_errors), np.std(model_errors)
-                # model_score = np.clip(score_mu-0.01*score_std, 0, np.inf)
-                model_score = np.clip(score_mu, 0, np.inf)
+                if stack:
+                    model_score = stacking_score[sg_model]
+                else:
+                    score_mu, score_std = np.mean(model_errors), np.std(model_errors)
+                    model_score = np.clip(score_mu-0.01*score_std, 0, np.inf)
+                    # model_score = np.clip(score_mu, 0, np.inf)
 
                 # make prediction using all bootstrapping generated models to get mean and std
                 preds = []

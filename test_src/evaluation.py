@@ -1,8 +1,38 @@
 import numpy as np
 import os, pickle
 from sklearn.metrics import accuracy_score, r2_score
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.linear_model import RidgeCV, LogisticRegression, RidgeClassifier, LinearRegression
+from sklearn.ensemble import StackingRegressor, StackingClassifier, RandomForestClassifier, GradientBoostingClassifier, RandomForestRegressor, GradientBoostingRegressor
+from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin, clone
 from src.surrogate_model import SurrogateModel, hyperparameter_optimization
+
+class AbstractSurrogateModel(BaseEstimator, RegressorMixin):
+    def __init__(self, model_name, models):
+        self.model_name = model_name
+        self.models = models
+
+    def fit(self, X, y):
+        pass  # 已经拟合好，不需要再 fit
+
+    def predict(self, X):
+        predictions = np.array([model.predict(X) for model in self.models])
+        return np.mean(predictions, axis=0)
+
+    def predict_proba(self, X):
+        if hasattr(self.models[0], "predict_proba"):
+            probas = np.array([model.predict_proba(X) for model in self.models])
+            return np.mean(probas, axis=0)
+        else:
+            predictions = np.array([model.predict(X) for model in self.models])
+            mean_pred = np.mean(predictions, axis=0)
+            std_pred = np.std(predictions, axis=0)
+            # 使用正态分布模拟概率分布
+            lower_bound = mean_pred - 1.96 * std_pred
+            
+            upper_bound = mean_pred + 1.96 * std_pred
+            probas = np.clip((X - lower_bound) / (upper_bound - lower_bound), 0, 1)
+            return np.vstack((1 - probas, probas)).T
 
 class ModelEvaluator:
     def __init__(self, X_train, y_train, file_path=None):
@@ -10,21 +40,15 @@ class ModelEvaluator:
         self.y_train = y_train
         self.file_path = file_path if file_path is not None else f'{os.getcwd()}/model_weights'
 
-    def save_models(self, model_name, optimized_params, models, model_errors, file_name):
+    def save_models(self, model_name, optimized_params, models, model_errors, file_name, stacking_model=None, stacking_error=None):
         if not os.path.exists(f'{self.file_path}'):
             os.mkdir(f'{self.file_path}')
         with open(f'{self.file_path}/{file_name}', 'wb') as f:
-            pickle.dump({'model_name': model_name, 'optimized_params': optimized_params, 'models': models, 'model_errors':model_errors}, f)
+            pickle.dump({'model_name': model_name, 'optimized_params': optimized_params, 'models': models, 'errors': model_errors}, f)
 
     def load_models(self, file_name):
         with open(f'{self.file_path}/{file_name}', 'rb') as f:
             data = pickle.load(f)
-        
-        # model_name = data['model_name']
-        # optimized_params = data['optimized_params']
-        # models = data['models']
-        # model_errors = data['model_errors']
-
         return data
 
     def bootstrap_evaluation(self, model_name, optimized_params, num_target, n_bootstrap_sample_nums=20, cls=False, use_full_eval=False, cross_val=False, cv_n_splits=5):
@@ -32,7 +56,7 @@ class ModelEvaluator:
         errors = []
         models = []
         X_bs = self.X_train
-        y_bs = self.y_train[:,num_target]
+        y_bs = self.y_train[:, num_target]
         if n_bootstrap_sample_nums < 2:
             n_bootstrap_sample_nums = 2
         cv_n_splits = min(n_bootstrap_sample_nums, cv_n_splits)
@@ -105,7 +129,7 @@ class ModelEvaluator:
 
         return [models, errors]
 
-    def evaluate(self, model_names, num_target, n_bootstrap_sample_nums, cls=False, use_full_eval=False, cross_val = False):
+    def evaluate(self, model_names, num_target, n_bootstrap_sample_nums, cls=False, use_full_eval=False, cross_val=False):
         model_results = {}
 
         for model_name in model_names:
@@ -116,10 +140,70 @@ class ModelEvaluator:
                 cross_val = False
             
             # 优化超参数
-            optimized_params = hyperparameter_optimization(model_name, self.X_train, self.y_train[:,num_target], cls=cls)
+            optimized_params = hyperparameter_optimization(model_name, self.X_train, self.y_train[:, num_target], cls=cls)
             # 评估模型
             models, errors = self.bootstrap_evaluation(model_name, optimized_params, num_target, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=cls, use_full_eval=use_full_eval, cross_val=cross_val)
-            model_results[model_name] = {'model': models, 'error': errors}
+            model_results[model_name] = {'models': models, 'errors': errors}
 
         return model_results
 
+    ### possible meta classifiers: RidgeCV, LogisticRegression, RidgeClassifier, LinearRegression, RandomForestClassifier, GradientBoostingClassifier, RandomForestRegressor, GradientBoostingRegressor
+    def train_stacking_model(self, model_results=None, num_target=0, cls=False, meta_classifier=None, use_probas=False, model_name_list=None):
+        if model_results is None:
+            if model_name_list is None:
+                raise ValueError("When model_results is None, model_name_list must be provided.")
+            model_results = {}
+            for model_name in model_name_list:
+                file_path = f"{self.file_path}/{model_name}_{num_target}_bootstrap.pkl"
+                with open(file_path, 'rb') as f:
+                    data = pickle.load(f)
+                model_results[model_name] = data
+        
+        base_models = [(model_name, AbstractSurrogateModel(model_name, model_info['models'])) for model_name, model_info in model_results.items()]
+        
+        if meta_classifier is None:
+            meta_classifier = RandomForestClassifier() if cls else RandomForestRegressor()
+
+        if use_probas and cls:
+            stacking_model = StackingClassifier(estimators=base_models, final_estimator=meta_classifier, stack_method='predict_proba')
+        else:
+            stacking_model = StackingClassifier(estimators=base_models, final_estimator=meta_classifier) if cls else StackingRegressor(estimators=base_models, final_estimator=meta_classifier)
+
+        # X_meta = np.zeros((self.X_train.shape[0], len(base_models)))
+        # for i, (_, model) in enumerate(base_models):
+        #     if use_probas and cls:
+        #         X_meta[:, i] = model.predict_proba(self.X_train)[:, 1]
+        #     else:
+        #         X_meta[:, i] = model.predict(self.X_train)
+
+        X_meta = self.X_train
+        y_meta = self.y_train[:, num_target]
+        stacking_model.fit(X_meta, y_meta)
+        
+        # 获取基础模型的权重或系数
+        if hasattr(stacking_model.final_estimator_, 'coef_'):
+            base_model_contributions = stacking_model.final_estimator_.coef_
+        elif hasattr(stacking_model.final_estimator_, 'feature_importances_'):
+            base_model_contributions = stacking_model.final_estimator_.feature_importances_
+        else:
+            base_model_contributions = None
+
+        base_model_errors = {}
+        for i, (model_name, _) in enumerate(base_models):
+            if base_model_contributions is not None:
+                contribution_score = base_model_contributions[i]
+            else:
+                contribution_score = None  # 如果没有权重或特征重要性，就设置为None
+            base_model_errors[model_name] = contribution_score
+        
+        return stacking_model, base_model_errors
+
+    def evaluate_with_stacking(self, model_names, num_target, n_bootstrap_sample_nums, cls=False, use_full_eval=False, cross_val=False, meta_classifier=None, use_probas=False):
+        model_results = self.evaluate(model_names, num_target, n_bootstrap_sample_nums, cls=cls, use_full_eval=use_full_eval, cross_val=cross_val)
+        stacking_model, base_model_errors = self.train_stacking_model(model_results, num_target, cls=cls, meta_classifier=meta_classifier, use_probas=use_probas, model_name_list=model_names)
+        model_results['stacking_error'] = base_model_errors
+        model_results['stacking_model'] = stacking_model
+        with open(f'{self.file_path}/stacking_results_{num_target}.pkl', 'wb') as f:
+            pickle.dump(model_results, f)
+        
+        return model_results

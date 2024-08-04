@@ -9,7 +9,7 @@ from src.acquisition_function import AcquisitionFunction
 from src.sampling import Sampler
 
 class BayesianOptimization:
-    def __init__(self, data_file, target_props, feature_props=None, optimization_goal='maximize', scaler_method='standard', model_list=None, model_path=f'{os.getcwd()}/model_weights', acq_method='ucb', close_pool_initial_samples=10, close_pool_threshold=None):
+    def __init__(self, data_file, target_props, feature_props=None, optimization_goal='maximize', scaler_method='standard', model_list=None, model_path=f'{os.getcwd()}/model_weights', stacking=False, acq_method='ucb', close_pool_initial_samples=10, close_pool_threshold=None):
         self.data_file = data_file
         self.target_props = target_props
         self.feature_props = feature_props
@@ -18,6 +18,7 @@ class BayesianOptimization:
         self.io_manager = IOManager(method=scaler_method)
         self.model_list = model_list if model_list is not None else ['Ridge', 'Lasso', 'ElasticNet', 'KNeighborsRegressor', 'DecisionTreeRegressor', 'RandomForest', 'SVR', 'MLPRegressor', 'GradientBoostingRegressor', 'AdaBoostRegressor', 'ExtraTreesRegressor', 'XGBoost', 'LightGBM'] # 'LinearRegression' is deprecated
         self.model_path = model_path
+        self.stacking = stacking
         self.acq_method = acq_method
 
         # Data reading and scaling
@@ -57,13 +58,19 @@ class BayesianOptimization:
             
             target_model_res = {}
             for target_idx in range(y_train.shape[1]):
-                modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False)  # *** TBD: add the automatice column cls detection
+                # *** TBD: add the automatice column cls detection
+                if self.stacking:
+                    modelres = model_evaluator.evaluate_with_stacking(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False)
+                else:
+                    modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False)  
                 target_model_res[target_idx] = modelres
 
-            ### by adding the 'model_result' parameter, acquisition_function.select_next function can directly using the model saving in computer memory; 
-            # next_indexes = acquisition_function.select_next(method=self.acq_method, X_candidate=candidate_X_scaled, model_name_list=self.model_list, num_target=y_train.shape[1], model_path=self.model_path, batch_size=batch_size, y_best=current_best, model_result=target_model_res)
+            ### by adding the 'model_result' parameter, acquisition_function.select_next function can directly using the model saving in computer memory
+            # next_indexes = acquisition_function.select_next(method=self.acq_method, X_candidate=candidate_X_scaled, model_name_list=self.model_list, num_target=y_train.shape[1], model_path=self.model_path, batch_size=batch_size, y_best=current_best, model_result=target_model_res, stack = self.stacking)
+            
             ### if value of 'model_result' parameter is not provided, function will try to load the saved model from model_weight saving folder
-            next_indexes = acquisition_function.select_next(method=self.acq_method, X_candidate=candidate_X_scaled, model_name_list=self.model_list, num_target=y_train.shape[1], model_path=self.model_path, batch_size=batch_size, y_best=current_best)
+            next_indexes = acquisition_function.select_next(method=self.acq_method, X_candidate=candidate_X_scaled, model_name_list=self.model_list, num_target=y_train.shape[1], model_path=self.model_path, batch_size=batch_size, y_best=current_best, stack = self.stacking)
+            
             y_next = y_candidate[next_indexes]
             current_best_next = np.max(np.prod(y_next-self.cplb, axis=1))
             print(f'train_best and sampling best: {current_best}, {current_best_next}')

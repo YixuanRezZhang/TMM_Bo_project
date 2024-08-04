@@ -17,3 +17,4 @@ install via:
 - material compositions-to-descriptors processing
 - automatized characterization
 - Ray parallel processing
+- state tracking to using historical information

@@ -16,13 +16,13 @@ class BayesianOptimization:
         self.optimization_goal = optimization_goal
         self.scaler_method = scaler_method
         self.io_manager = IOManager(method=scaler_method)
-        self.model_list = model_list if model_list is not None else ['Ridge', 'Lasso', 'ElasticNet', 'KNeighborsRegressor', 'DecisionTreeRegressor', 'RandomForest', 'SVR', 'MLPRegressor', 'GradientBoostingRegressor', 'AdaBoostRegressor', 'ExtraTreesRegressor', 'XGBoost', 'LightGBM'] # 'LinearRegression' is deprecated
+        self.model_list = model_list if model_list is not None else ['Ridge', 'Lasso', 'ElasticNet', 'KNeighborsRegressor', 'DecisionTreeRegressor', 'RandomForest', 'SVR', 'MLPRegressor', 'GradientBoostingRegressor', 'AdaBoostRegressor', 'ExtraTreesRegressor', 'XGBoost', 'LightGBM', 'GaussianProcess'] # 'LinearRegression' is deprecated
         self.model_path = model_path
         self.stacking = stacking
         self.acq_method = acq_method
 
         # Data reading and scaling
-        self.X, self.y = self.io_manager.read_data(data_file, target_props=target_props, feature_props=feature_props)
+        self.X, self.y = self.io_manager.read_data(data_file, target_props=target_props, feature_props=feature_props, handle_null=True, drop_non_numeric=True)
         self.y = -self.y if self.optimization_goal == 'minimize' else self.y
 
         self.close_pool_initial_samples = min(close_pool_initial_samples, (len(self.y)//10+1))

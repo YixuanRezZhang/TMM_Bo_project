@@ -19,7 +19,6 @@ class IOManager:
     def read_data(self, file_name, target_props, feature_props=None, descriptor_type='magpie', handle_null=True, drop_non_numeric=True):
         file_path = os.path.join(self.root, f'{file_name}')
         data = pd.read_csv(file_path)
-        print(drop_non_numeric)
 
         # 检查指定的列是否存在
         missing_cols = [col for col in target_props if col not in data.columns]
@@ -30,15 +29,19 @@ class IOManager:
 
         # Check for null values
         if data.isnull().values.any():
+            print(f'data contains null value!')
             if not handle_null:
                 raise ValueError("Data contains null values. Please handle them or set handle_null to True.")
+            else:
+                data = self.handle_null_values(data, target_props, drop_non_numeric=drop_non_numeric)
         else:
-            data = self.handle_null_values(data, target_props, drop_non_numeric)
+            data = self.handle_null_values(data, target_props, drop_non_numeric=drop_non_numeric)
 
         # 如果没有指明feature_props, 使用除target外所有列
         if feature_props is None:
             feature_props = [col for col in data.columns if col not in target_props]
-
+        print(f'used feature set: {feature_props}')
+        
         # 检查指定的feature列是否存在
         missing_feature_cols = [col for col in feature_props if col not in data.columns]
         if missing_feature_cols:
@@ -64,13 +67,17 @@ class IOManager:
                 else:
                     raise ValueError(f"Target column {target} contains non-numeric data that cannot be converted to binary classification.")
 
-        # 处理非target列的null值，通过删除包含null的列
+        # 处理非target列的null值，通过删除包含null的行
         for column in data.columns:
-            if column not in target_props and data[column].isnull().any():
-                data = data.drop(columns=[column])
-                
-            if drop_non_numeric and not pd.api.types.is_numeric_dtype(data[column]):
-                data = data.drop(columns=[column])
+            if column not in target_props:
+                if data[column].isnull().any():
+                    # print(f'drop feature column contains null: {column}')
+                    # data = data.drop(columns=[column])
+                    print(f'drop samples contains null: {column}')
+                    data = data.dropna(subset=[column])
+                elif drop_non_numeric and not pd.api.types.is_numeric_dtype(data[column]):
+                    print(f'drop non numeric column: {column}')
+                    data = data.drop(columns=[column])
 
         return data
 

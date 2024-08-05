@@ -30,17 +30,19 @@ class BayesianOptimization:
             self.cplb = np.min(self.y, axis=0)
             product = np.prod(self.y-self.cplb, axis=1)
             indexes = np.argsort(product)
-            select_index = int(len(self.y)*0.99)
+            select_index = max(int(len(self.y)*0.99), len(self.y)-50)
             self.close_pool_threshold = product[indexes][select_index].item()
+            self.close_pool_init = product[indexes][int(len(self.y)*0.8)].item()
         
 
     def close_pooling_test(self, n_bootstrap_sample_nums=20, n_iter=100, batch_size=10, hpar=0.1):
-
+        
+        print(f'Threshold is {self.close_pool_threshold}, init_sampling threshold is {self.close_pool_init}')
         X_train, X_candidate, y_train, y_candidate = train_test_split(self.X, self.y, test_size=1 - self.close_pool_initial_samples / len(self.X))
         # print(X_train.shape, y_train.shape)
         current_best = np.max(np.prod(y_train-self.cplb, axis=1))
 
-        while current_best >= self.close_pool_threshold:
+        while current_best >= self.close_pool_init:
             X_train, X_candidate, y_train, y_candidate = train_test_split(self.X, self.y, test_size=1 - self.close_pool_initial_samples / len(self.X))
             current_best = np.max(np.prod(y_train-self.cplb, axis=1))
 
@@ -48,7 +50,7 @@ class BayesianOptimization:
             f.write('iter_num\tnumber_of_samples\tmean_value_of_this_iteration\tstd_of_this_iteration\tbest_value_of_this_iteration\tcurrent_best_value\n')
     
         acquisition_function = AcquisitionFunction(hpar)
-        print(f'Threshold is {self.close_pool_threshold}')
+
         
         for i in range(n_iter):
 
@@ -66,17 +68,19 @@ class BayesianOptimization:
                 target_model_res[target_idx] = modelres
 
             ### by adding the 'model_result' parameter, acquisition_function.select_next function can directly using the model saving in computer memory
-            # next_indexes = acquisition_function.select_next(method=self.acq_method, X_candidate=candidate_X_scaled, model_name_list=self.model_list, num_target=y_train.shape[1], model_path=self.model_path, batch_size=batch_size, y_best=current_best, model_result=target_model_res, stack = self.stacking)
+        
+            next_indexes = acquisition_function.select_next(method=self.acq_method, X_candidate=candidate_X_scaled, model_name_list=self.model_list, num_target=y_train.shape[1], model_path=self.model_path, batch_size=batch_size, y_best=current_best, model_result=target_model_res, stack = self.stacking)
             
             ### if value of 'model_result' parameter is not provided, function will try to load the saved model from model_weight saving folder
-            next_indexes = acquisition_function.select_next(method=self.acq_method, X_candidate=candidate_X_scaled, model_name_list=self.model_list, num_target=y_train.shape[1], model_path=self.model_path, batch_size=batch_size, y_best=current_best, stack = self.stacking)
+            
+            # next_indexes = acquisition_function.select_next(method=self.acq_method, X_candidate=candidate_X_scaled, model_name_list=self.model_list, num_target=y_train.shape[1], model_path=self.model_path, batch_size=batch_size, y_best=current_best, stack = self.stacking)
             
             y_next = y_candidate[next_indexes]
             current_best_next = np.max(np.prod(y_next-self.cplb, axis=1))
             print(f'train_best and sampling best: {current_best}, {current_best_next}')
 
             with open('performance_record.txt', 'a') as f:
-                f.write(f'{i}\t{len(y_train)}\t{np.mean(y_next)}\t{np.std(y_next)}\t{current_best_next}\t{current_best}\n')
+                f.write(f'{i}\t{len(y_train)}\t{np.mean(y_next-self.cplb)}\t{np.std(y_next-self.cplb)}\t{current_best_next}\t{current_best}\n')
 
             X_train = np.vstack([X_train, X_candidate[next_indexes]])
             y_train = np.vstack([y_train, y_next])

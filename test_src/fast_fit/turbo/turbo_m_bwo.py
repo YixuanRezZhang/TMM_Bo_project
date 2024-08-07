@@ -26,7 +26,7 @@ from .turbo_1 import Turbo1
 from .utils import from_unit_cube, latin_hypercube, to_unit_cube
 
 
-class TurboM(Turbo1):
+class TurboM_bwo(Turbo1):
     """The TuRBO-m algorithm.
 
     Parameters

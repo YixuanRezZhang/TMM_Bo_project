@@ -1,4 +1,4 @@
-import os, ray, multiprocessing
+import os, ray
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -7,11 +7,13 @@ from src.surrogate_model import SurrogateModel, hyperparameter_optimization
 from src.evaluation import ModelEvaluator
 from src.acquisition_function import AcquisitionFunction
 from src.sampling import Sampler
+from src.fast_fit.bwo import BWO
+from src.fast_fit.turbo import TurboM
+from src.fast_fit.turbo import TurboM_bwo
 
-# try:
-#     multiprocessing.set_start_method('spawn', force=True)
-# except RuntimeError:
-#     pass
+import torch
+from torch.quasirandom import SobolEngine
+from botorch.utils.transforms import normalize, unnormalize
 
 if not ray.is_initialized():
     ray.init()
@@ -141,3 +143,199 @@ class BayesianOptimization:
         pd_samples_next.to_csv(f'{os.getcwd()}/suggested_samples.csv', index=False)
         
         return samples_next
+
+
+### ----------------------------------------- part for parameters fitting------------------------------------------------- ###
+
+class ParamsFitting:
+    def __init__(self, func):
+        self.func = func
+
+    ### suiatble for easy quick func, normally need 10,000 estimations
+    def BO_BWO(self, SearchAgents_no=100, Max_iteration=1000, record_file=f'{os.getcwd()}/Data/fit_res.csv', target_column='loss', serial_function=False):
+        res = BWO.BWO(self.func, list(self.func.lb), list(self.func.ub), self.func.dim, SearchAgents_no, Max_iteration, record_file=record_file, target_column=target_column, serial_function=serial_function)
+        f_best, x_best = res.best, res.bestIndividual
+
+        return {'X_best': x_best, 'Best_value': f_best[0]}
+
+    ### Best performance, universal application
+    def BO_Turbo(self, n_trust_regions=5, batch_size=8, max_evals=1000, suggest_X=None):
+        n_init = 2 * self.func.dim  # 2*dim, which corresponds to 5 batches of 4
+        turbo_m = TurboM(
+            f=self.func,  # Handle to objective function
+            lb=self.func.lb,  # Numpy array specifying lower bounds
+            ub=self.func.ub,  # Numpy array specifying upper bounds
+            n_init=n_init,  # Number of initial bounds from an Symmetric Latin hypercube design
+            max_evals=max_evals,  # Maximum number of evaluations
+            n_trust_regions=n_trust_regions,  # Number of trust regions
+            batch_size=batch_size,  # How large batch size TuRBO uses
+            suggest_X=suggest_X,  # if you have suggested params set,
+            verbose=True,  # Print information from each batch
+            use_ard=True,  # Set to true if you want to use ARD for the GP kernel
+            serial_function=False,  # set to true if your function cannot calculate multiple X simultaneously
+            max_cholesky_size=1000,  # When we switch from Cholesky to Lanczos
+            n_training_steps=100,  # Number of steps of ADAM to learn the hypers
+            min_cuda=1024,  # Run on the CPU for small datasets
+            device="cuda",  # "cpu" or "cuda"
+            dtype="float64",  # float64 or float32
+            record_file=f'{os.getcwd()}/Data/fit_res.csv',
+            target_column=f'loss',
+        )
+        turbo_m.optimize()
+        X = turbo_m.X  # Evaluated points
+        fX = turbo_m.fX  # Observed values
+        ind_best = np.argmin(fX)
+        f_best, x_best = fX[ind_best], X[ind_best, :]
+
+        return {'X_best': x_best, 'Best_value': f_best[0]}
+
+    ### Best performance, universal application, less robust than BO_Turbo
+    def BO_Turbo_bwo(self, n_trust_regions=5, batch_size=8, max_evals=1000, suggest_X=None):
+        n_init = 2 * self.func.dim  # 2*dim, which corresponds to 5 batches of 4
+        turbo_m = TurboM_bwo(
+            f=self.func,  # Handle to objective function
+            lb=self.func.lb,  # Numpy array specifying lower bounds
+            ub=self.func.ub,  # Numpy array specifying upper bounds
+            n_init=n_init,  # Number of initial bounds from an Symmetric Latin hypercube design
+            max_evals=max_evals,  # Maximum number of evaluations
+            n_trust_regions=n_trust_regions,  # Number of trust regions
+            batch_size=batch_size,  # How large batch size TuRBO uses
+            suggest_X=suggest_X,  # if you have suggested params set,
+            verbose=True,  # Print information from each batch
+            use_ard=True,  # Set to true if you want to use ARD for the GP kernel
+            serial_function=False,  # set to true if your function cannot calculate multiple X simultaneously
+            max_cholesky_size=1000,  # When we switch from Cholesky to Lanczos
+            n_training_steps=100,  # Number of steps of ADAM to learn the hypers
+            min_cuda=1024,  # Run on the CPU for small datasets
+            device="cuda",  # "cpu" or "cuda"
+            dtype="float64",  # float64 or float32
+            record_file=f'{os.getcwd()}/Data/fit_res.csv',
+            target_column=f'loss',
+        )
+        turbo_m.optimize()
+        X = turbo_m.X  # Evaluated points
+        fX = turbo_m.fX  # Observed values
+        ind_best = np.argmin(fX)
+        f_best, x_best = fX[ind_best], X[ind_best, :]
+
+        return {'X_best': x_best, 'Best_value': f_best[0]}
+
+    ### Slow, robust, but least efficient
+    def BO_Boosting(self, n_pts=10, max_iteratio=100):
+        sobol = SobolEngine(dimension=self.func.dim, scramble=True)
+        init_X = sobol.draw(n=n_pts)
+        init_X = unnormalize(init_X, self.func.bounds).cpu().numpy()
+        init_y = self.func(init_X)
+        target_props = ['loss']
+        data_file = os.path.join(os.getcwd(), 'Data/fit_res.csv')
+        
+        all_X = []
+        all_y = []
+        
+        for iter in range(max_iteratio):
+            BO = BayesianOptimization(data_file, target_props, model_list=None, optimization_goal='minimize', acq_method='ucb', scaler_method='minmax', stacking=True)
+            samples_next_X = BO.optimize(batch_size=20, n_bootstrap_sample_nums=20, sampling_method='monte_carlo', num_candidate=1000, n_samples=1000, iterations=20, hpar=0.1, lb=self.func.lb, ub=self.func.ub, all_surrogate_sampling=False)
+            samples_next_y = self.func(samples_next_X)
+            
+            # 记录每一步的samples_next_X和samples_next_y
+            all_X.append(samples_next_X)
+            all_y.append(samples_next_y)
+            
+            print(f'Iteration {iter+1}: next minimum: {np.min(samples_next_y)}\n\n\n')
+        
+        all_X = np.vstack(all_X)
+        all_y = np.hstack(all_y)
+        
+        ind_best = np.argmin(all_y)
+        f_best, x_best = all_y[ind_best], all_X[ind_best, :]
+        
+        return {'X_best': x_best, 'Best_value': f_best[0]}
+
+### Abstract IO and ExecuteModule for ParamsFitting
+class ParamsFittingIO:
+    def __init__(self, root_path, input_file_name='in.lua', output_file_name='out.Quanty', input_templates_file_name='10_RIXS_L23_M45.lua', target_file_name='10_RIXS_L23_M45.Quanty'):
+        self.root_path = root_path
+        self.input_file_name = input_file_name
+        self.output_file_name = output_file_name
+        self.input_templates_file_name = input_templates_file_name
+        self.target_file_name = target_file_name
+
+    ### ParamsFittingExecuteModule output reading, for read the simulation output or automatic experiment output from ParamsFittingExecuteModule
+    def read_output(self, folder):
+        raise NotImplementedError
+
+    ### ParamsFittingExecuteModule target reading, for read the to be fitted target value
+    def read_target(self, folder):
+        raise NotImplementedError
+
+    ### ParamsFitting suggestted parameter reading, if suggestted parameters can not be automatically passed to fitting module ()
+    def read_parameters(self, folder):
+        raise NotImplementedError
+
+    ### used for value interpolation, for example, the ParamsFittingExecuteModule output image has different resolution compared with target image
+    def value_interpolation(self, output):
+        raise NotImplementedError
+
+    ### modify the input file of ParamsFittingExecuteModule
+    def modify_input(self, dict_para):
+        raise NotImplementedError
+
+### part for Executing simulation or experiment. This part will be act as 'func' parameter in the ParamsFitting
+class ParamsFittingExecuteModule:
+    def __init__(self, dim=15, lb=None, ub=None):
+        self.dim = dim
+        self.lb = lb
+        self.ub = ub
+        self.bounds = np.stack([self.lb, self.ub]) if lb is not None and ub is not None else None
+
+    def __call__(self, X):
+        IO = ParamsFittingIO(root_path)
+        ### 1. read in target_file, get target value;
+        ### 2. modify the input file/files according to X/Xs
+        ### 3. Executing simulation/experiment to get output file
+        ### 3.5. value interpolation (optional)
+        ### 4. compare loss between output and target: eg. loss = abs(target-output)
+        ### 5. write to csv file by following command:  self.append_to_csv(root_path, X, loss)
+        ### 6. return loss
+        raise NotImplementedError
+
+    ### can be applied to both single input or batch input
+    def append_to_csv(self, root_path, X_batch, y_batch, target_name='loss', feature_names=None):
+        # Define the CSV file path
+        csv_file = os.path.join(root_path, 'Data/fit_res.csv')
+
+        if os.path.isfile(csv_file):
+            existing_df = pd.read_csv(csv_file)
+            existing_columns = existing_df.columns.tolist()
+            if target_name not in existing_columns:
+                raise ValueError(f"Missing target columns: {target_name}")
+            else:
+                feature_names = [col for col in existing_columns if col != target_name]
+
+        # Ensure X_batch and y_batch are 2D arrays
+        if X_batch.ndim == 1:
+            X_batch = np.expand_dims(X_batch, axis=0)
+
+        # Create a dictionary with column names and values
+        if feature_names is None:
+            feature_names = ['index' + str(i) for i in range(X_batch.shape[1])]
+
+        data = {feature_names[i]: X_batch[:, i] for i in range(X_batch.shape[1])}
+        data[target_name] = y_batch.reshape(-1)
+        
+        # Convert the dictionary to a DataFrame
+        df = pd.DataFrame(data)
+
+        # Check if the file exists
+        if not os.path.isfile(csv_file):
+            # If the file does not exist, create it with headers
+            df.to_csv(csv_file, index=False)
+        else:
+            # If the file exists, append the data without headers
+            df.to_csv(csv_file, mode='a', header=False, index=False)
+
+### exapmle usage: 
+### func = ParamsFittingExecuteModule(dim, lb, ub)
+### fitting_results = ParamsFitting(fun_q).BO_Turbo()
+
+

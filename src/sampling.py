@@ -1,4 +1,11 @@
+import multiprocessing
+import ray
 import numpy as np
+from sklearn.base import BaseEstimator, RegressorMixin
+
+import numpy as np
+import ray
+import importlib
 from sko.GA import GA
 from sko.PSO import PSO
 from sko.SA import SA
@@ -7,7 +14,10 @@ from sko.DE import DE
 from sko.IA import IA_TSP
 from sko.AFSA import AFSA
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from src.evaluation import AbstractSurrogateModel
 
+if not ray.is_initialized():
+    ray.init()
 ### TBD: 检查模型模型从candidate_list中随机采样的功能和添加离散化采样函数
 
 class Sampler:
@@ -65,38 +75,6 @@ class Sampler:
         if n_samples*iterations < num_candidate:
             raise ValueError("Total sampling points must be greater than num_candidate")
 
-
-        best_sample = None
-        best_value = float('inf')
-        top_samples = []
-
-        for iteration in range(iterations):
-            samples = search_space[np.random.choice(search_space.shape[0], n_samples, replace=False)]
-            values = -model.predict(samples)
-
-            min_index = np.argmin(values)
-            current_best_sample = samples[min_index]
-            current_best_value = values[min_index]
-
-            if current_best_value < best_value:
-                best_sample = current_best_sample
-                best_value = current_best_value
-
-            top_samples.append(best_sample)
-
-            new_samples = []
-            for _ in range(n_samples):
-                step = self.levy_flight(Lambda) * perturbation_scale
-                new_sample = best_sample + step * np.random.randn(feature_dim)
-                if isinstance(self.scaler, MinMaxScaler):
-                    new_sample = np.clip(new_sample, 0, 1)
-                elif isinstance(self.scaler, StandardScaler):
-                    new_sample = np.clip(new_sample, -3, 3)  # Assuming 3 standard deviations as bounds
-                new_samples.append(new_sample)
-
-            new_samples = np.array(new_samples)
-            search_space = np.vstack((search_space, new_samples))
-
         best_sample = None
         best_value = float('inf')
         top_samples = []
@@ -105,7 +83,7 @@ class Sampler:
         
         for iteration in range(iterations):
             samples = search_space[np.random.choice(search_space.shape[0], n_samples, replace=False)]
-            values = -model.predict(samples).reshape(-1)
+            values = -model.predict(samples).reshape(-1)   # default optimization in sko is minimize, thus '-model'
         
             sorted_indices = np.argsort(values)
             top_indices = sorted_indices[:num_candidates_per_iteration]
@@ -152,7 +130,7 @@ class Sampler:
 
         def fitness_func(individual):
             return -model.predict(np.array(individual).reshape(1, -1)).item()
-
+            
         ga = GA(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=generations, lb=lb, ub=ub)
         best_x, best_y = ga.run()
         print(f'best_value: {best_y}')
@@ -183,16 +161,19 @@ class Sampler:
 
         return np.array(pso.X[-num_candidate:])
 
+    ## SA cannot control boundary, modification needed
     def simulated_annealing_sampling(self, model, feature_dim, iterations=1000, num_candidate=10, candidate_list=None):
         
+        # iterations = (num_candidate//(2*iterations)+1)*iterations if iterations<num_candidate//2 else iterations
+        # SA_iter_nums = num_candidate//70+1
         iterations = (num_candidate//(2*iterations)+1)*iterations if iterations<num_candidate//2 else iterations
-        SA_iter_nums = num_candidate//70+1
+        SA_iter_nums = 1
 
         samples = []
         for SA_iter in range(SA_iter_nums):
             if candidate_list is None:
                 if isinstance(self.scaler, MinMaxScaler):
-                    x0 = np.random.rand(feature_dim)
+                    x0 = np.clip(np.random.rand(feature_dim),0,1)
                 elif isinstance(self.scaler, StandardScaler):
                     x0 = np.random.randn(feature_dim)
                 else:
@@ -202,8 +183,29 @@ class Sampler:
     
             def fitness_func(x):
                 return -model.predict(np.array(x).reshape(1, -1)).item()
-    
+
+            def neighbor_func(x):
+                step = np.random.normal(0, 1, size=feature_dim) * 0.1
+                new_sample = x + step
+
+                if isinstance(self.scaler, MinMaxScaler):
+                    # Apply reflection to keep new_sample within bounds
+                    new_sample = np.where(new_sample < 0, -new_sample, new_sample)
+                    new_sample = np.where(new_sample > 1, 2-new_sample, new_sample)
+                elif isinstance(self.scaler, StandardScaler):
+                    new_sample = np.where(new_sample < -3, -6-new_sample, new_sample)
+                    new_sample = np.where(new_sample > 3, 6-new_sample, new_sample)                   
+            
+                return new_sample
+
+            # def neighbor_func(x):
+            #     step = np.random.normal(0, 1, size=feature_dim) * 0.1
+            #     new_sample = x + step
+            #     new_sample = np.clip(new_sample, 0, 1)  # Ensure the new sample is within the bounds [0, 1]
+            #     return new_sample
+
             sa = SA(func=fitness_func, x0=x0, T_max=100, T_min=1e-9, L=iterations)
+            sa.neighbor = neighbor_func  # Use custom neighbor function to ensure bounds
             best_x, best_y = sa.run()
             print(f'best_value: {best_y}')
 
@@ -252,7 +254,7 @@ class Sampler:
             lb, ub = np.min(candidate_list, axis=0), np.max(candidate_list, axis=0)
 
         def fitness_func(x):
-            return -model.predict(np.array(x).reshape(1, -1)).item()
+            return -ray.get(model.predict(np.array(x).reshape(1, -1))).item()
 
         de = DE(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=generations, lb=lb, ub=ub)
         best_x, best_y = de.run()
@@ -308,6 +310,11 @@ class Sampler:
 
         return np.array(afsa.X[-num_candidate:])
 
+    # Suggest using monte_carlo sampling
+    ## the robustness of [gaussian, monte_carlo] has been tested; [GA, PSO, DE, AFS] are functional, but slow; SA can not control the boundary; [ACA, IA] are used for path optimisation
+    ### highly suggest the developeer hack the skopt code, replacing mulltiprocess in sko with Ray Actor for parallelisation. (since the multiuprocess may conflict with ray in resources and process management)
+
+    ### Serial candidate generation
     def generate_candidates(self, method, model, feature_dim, num_candidate=100, n_samples=1000, iterations=50, candidate_list=None):
         ### method, model, feature_dim are the requested inputs
         if method == 'gaussian':
@@ -317,40 +324,122 @@ class Sampler:
         elif method == 'monte_carlo':
             return self.monte_carlo_sampling(model, feature_dim, n_samples=n_samples, iterations=iterations, perturbation_scale=0.1, Lambda=1.5, num_candidate=num_candidate, candidate_list=candidate_list)
         elif method == 'genetic_algorithm':
+            # GA = importlib.import_module('sko.GA').GA
             return self.genetic_algorithm_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
         elif method == 'particle_swarm':
+            # PSO = importlib.import_module('sko.PSO').PSO
             return self.particle_swarm_sampling(model, feature_dim, population_size=n_samples, iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
-        elif method == 'simulated_annealing':
-            return self.simulated_annealing_sampling(model, feature_dim, iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
-        # elif method == 'ant_colony':
-        #     return self.ant_colony_sampling(model, feature_dim, n_ants=n_samples, n_best=5, n_iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
         elif method == 'differential_evolution':
+            # DE = importlib.import_module('sko.DE').DE
             return self.differential_evolution_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
-        # elif method == 'immune_algorithm':
-        #     return self.immune_algorithm_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
         elif method == 'artificial_fish_swarm':
+            # AFSA = importlib.import_module('sko.AFSA').AFSA
             return self.artificial_fish_swarm_sampling(model, feature_dim, population_size=n_samples, iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+        elif method == 'simulated_annealing':
+            # SA = importlib.import_module('sko.SA').SA
+            return self.simulated_annealing_sampling(model, feature_dim, iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+        elif method == 'ant_colony':
+            # ACA_TSP = importlib.import_module('sko.ACA').ACA_TSP
+            return self.ant_colony_sampling(model, feature_dim, n_ants=n_samples, n_best=5, n_iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+        elif method == 'immune_algorithm':
+            # IA_TSP = importlib.import_module('sko.IA').IA_TSP
+            return self.immune_algorithm_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
         else:
             raise ValueError(f"Unknown sampling method: {method}")
 
+
+    ### the robustness of [gaussian, monte_carlo] has been tested; [GA, PSO, DE, AFS] are functional, but slow; SA can not control the boundary; [ACA, IA] are used for path optimisation
+
+    ### ray function for parallel candidate generation
+    @ray.remote
+    def generate_candidates_ray(self, method, model, feature_dim, num_candidate=100, n_samples=1000, iterations=50, candidate_list=None):
+        ### method, model, feature_dim are the requested inputs
+        if method == 'gaussian':
+            return self.gaussian_sampling(feature_dim, num_candidate=num_candidate)
+        elif method == 'bernoulli':
+            return self.bernoulli_sampling(feature_dim, num_candidate=num_candidate)
+        elif method == 'monte_carlo':
+            return self.monte_carlo_sampling(model, feature_dim, n_samples=n_samples, iterations=iterations, perturbation_scale=0.1, Lambda=1.5, num_candidate=num_candidate, candidate_list=candidate_list)
+        elif method == 'genetic_algorithm':
+            # GA = importlib.import_module('sko.GA').GA
+            return self.genetic_algorithm_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+        elif method == 'particle_swarm':
+            # PSO = importlib.import_module('sko.PSO').PSO
+            return self.particle_swarm_sampling(model, feature_dim, population_size=n_samples, iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+        elif method == 'differential_evolution':
+            # DE = importlib.import_module('sko.DE').DE
+            return self.differential_evolution_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+        elif method == 'artificial_fish_swarm':
+            # AFSA = importlib.import_module('sko.AFSA').AFSA
+            return self.artificial_fish_swarm_sampling(model, feature_dim, population_size=n_samples, iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+        elif method == 'simulated_annealing':
+            # SA = importlib.import_module('sko.SA').SA
+            return self.simulated_annealing_sampling(model, feature_dim, iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+        elif method == 'ant_colony':
+            # ACA_TSP = importlib.import_module('sko.ACA').ACA_TSP
+            return self.ant_colony_sampling(model, feature_dim, n_ants=n_samples, n_best=5, n_iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+        elif method == 'immune_algorithm':
+            # IA_TSP = importlib.import_module('sko.IA').IA_TSP
+            return self.immune_algorithm_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+        else:
+            raise ValueError(f"Unknown sampling method: {method}")
+
+    ### Parallel candidate generation
+    def generate_candidate_parallel(self, method, feature_dim, model_results, model_list, num_candidate=100, n_samples=1000, iterations=50, candidate_list=None, all_surrogate_sampling=False, parallel=True):
+
+        candidate_tasks = []
+        candidates = []
+        for target_i in model_results.keys():
+            for sg_model in model_list:
+                models = model_results[target_i][sg_model]['models']
+                model_errors = model_results[target_i][sg_model]['errors']
+
+                if parallel:
+                    if all_surrogate_sampling:
+                        for model in models:
+                            candidate_tasks.append(self.generate_candidates_ray.remote(self, method=method, model=model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations))
+                    else:
+                        ensemble_model = AbstractSurrogateModel(sg_model, models)
+                        candidate_tasks.append(self.generate_candidates_ray.remote(self, method=method, model=ensemble_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations))
+                else:
+                    if all_surrogate_sampling:
+                        for model in models:
+                            candidate = self.generate_candidates(method=method, model=model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations)
+                            candidates.append(candidate)
+                    else:
+                        ensemble_model = AbstractSurrogateModel(sg_model, models)
+                        candidate = self.generate_candidates(method=method, model=ensemble_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations)
+                        candidates.append(candidate)
+
+        if parallel:
+            candidate_X_scaled = ray.get(candidate_tasks)  
+        else:
+            candidate_X_scaled = candidates
+            
+        candidate_X_scaled = np.vstack(candidate_X_scaled)
+        
+        return candidate_X_scaled
+
+    
+
 # 示例用法
-if __name__ == "__main__":
-    class DummyModel(BaseEstimator, RegressorMixin):
-        def fit(self, X, y):
-            pass
+# if __name__ == "__main__":
+#     class DummyModel(BaseEstimator, RegressorMixin):
+#         def fit(self, X, y):
+#             pass
     
-        def predict(self, X):
-            return np.sum(X, axis=1)
+#         def predict(self, X):
+#             return np.sum(X, axis=1)
     
-    # 创建一个样本数据集
-    X = np.random.rand(100, 10)
-    y = np.sum(X, axis=1)
+#     # 创建一个样本数据集
+#     X = np.random.rand(100, 10)
+#     y = np.sum(X, axis=1)
     
-    scaler = StandardScaler().fit(X)  # 假设这里使用的是StandardScaler
-    model = DummyModel()
-    model.fit(X, y)
+#     scaler = StandardScaler().fit(X)  # 假设这里使用的是StandardScaler
+#     model = DummyModel()
+#     model.fit(X, y)
     
-    sampler = Sampler(scaler)
-    feature_dim = X.shape[1]
-    candidates = sampler.generate_candidates('genetic_algorithm', model, feature_dim, n_samples=100, num_candidate=10)
-    print(candidates)
+#     sampler = Sampler(scaler)
+#     feature_dim = X.shape[1]
+#     candidates = sampler.generate_candidates('genetic_algorithm', model, feature_dim, n_samples=100, num_candidate=10)
+#     print(candidates)

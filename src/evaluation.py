@@ -1,5 +1,9 @@
+import ray
+if not ray.is_initialized():
+    ray.init(ignore_reinit_error=True)
+
 import numpy as np
-import os, pickle
+import os, pickle, torch
 from sklearn.metrics import accuracy_score, r2_score
 from sklearn.model_selection import KFold, train_test_split
 from sklearn.linear_model import RidgeCV, LogisticRegression, RidgeClassifier, LinearRegression
@@ -7,16 +11,29 @@ from sklearn.ensemble import StackingRegressor, StackingClassifier, RandomForest
 from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin, clone
 from src.surrogate_model import SurrogateModel, hyperparameter_optimization
 
+
 class AbstractSurrogateModel(BaseEstimator, RegressorMixin):
     def __init__(self, model_name, models):
         self.model_name = model_name
         self.models = models
 
+    @ray.remote
+    def model_predict(self, X, model):
+        if self.model_name == 'GaussianProcess':
+            Gmodel_res = model.model.posterior(torch.tensor(X, dtype=torch.float32))
+            Gmean = Gmodel_res.mean.detach().cpu().numpy().reshape(-1)
+            # Gstd = torch.sqrt(Gmodel_res.variance).detach().cpu().numpy().reshape(-1)
+            return Gmean
+        else:
+            preds = model.predict(X)
+            return preds
+
     def fit(self, X, y):
         pass  # 已经拟合好，不需要再 fit
 
     def predict(self, X):
-        predictions = np.array([model.predict(X) for model in self.models])
+        predictions = ray.get([self.model_predict.remote(self, X, model) for model in self.models])
+        predictions = np.array(predictions)
         return np.mean(predictions, axis=0)
 
     def predict_proba(self, X):
@@ -24,15 +41,16 @@ class AbstractSurrogateModel(BaseEstimator, RegressorMixin):
             probas = np.array([model.predict_proba(X) for model in self.models])
             return np.mean(probas, axis=0)
         else:
-            predictions = np.array([model.predict(X) for model in self.models])
+            predictions = ray.get([self.model_predict.remote(self, X, model) for model in self.models])
+            predictions = np.array(predictions)
             mean_pred = np.mean(predictions, axis=0)
             std_pred = np.std(predictions, axis=0)
             # 使用正态分布模拟概率分布
             lower_bound = mean_pred - 1.96 * std_pred
-            
             upper_bound = mean_pred + 1.96 * std_pred
             probas = np.clip((X - lower_bound) / (upper_bound - lower_bound), 0, 1)
             return np.vstack((1 - probas, probas)).T
+
 
 class ModelEvaluator:
     def __init__(self, X_train, y_train, file_path=None):
@@ -97,37 +115,45 @@ class ModelEvaluator:
                 models.append(model)
                 
             else:
+                bootstrap_tasks = []
                 for i in range(n_bootstrap_sample_nums):
                     bootstrap_indices = np.random.choice(np.arange(n_samples), size=n_samples, replace=True)
                     X_sample = X_bs[bootstrap_indices]
                     y_sample = y_bs[bootstrap_indices]
-        
-                    model = SurrogateModel(model_name, optimized_params)
-                    model.fit(X_sample, y_sample)
-        
-                    if use_full_eval:
-                        X_eval = X_bs
-                        y_eval = y_bs
-                    else:
-                        eval_indices = np.setdiff1d(np.arange(n_samples), bootstrap_indices)
-                        X_eval = X_bs[eval_indices] if len(eval_indices) != 0 else X_bs
-                        y_eval = y_bs[eval_indices] if len(eval_indices) != 0 else y_bs
-        
-                    preds = model.predict(X_eval)
-        
-                    if cls:
-                        error = accuracy_score(y_eval, preds)
-                    else:
-                        r2_error = np.clip(r2_score(y_eval, preds), 0, 1)
-                        error = r2_error
-        
-                    errors.append(error)
-                    models.append(model)
+                    bootstrap_tasks.append(self._train_model.remote(self, model_name, optimized_params, X_sample, y_sample, X_bs, y_bs, bootstrap_indices, cls, use_full_eval))
+
+                results = ray.get(bootstrap_tasks)
+                for res in results:
+                    models.append(res['model'])
+                    errors.append(res['error'])
 
         # 保存每个模型名称的所有 bootstrap 结果
         self.save_models(model_name, optimized_params, models, errors, f"{model_name}_{num_target}_bootstrap.pkl")
 
         return [models, errors]
+
+    @ray.remote
+    def _train_model(self, model_name, optimized_params, X_sample, y_sample, X_bs, y_bs, bootstrap_indices, cls, use_full_eval):
+        model = SurrogateModel(model_name, optimized_params)
+        model.fit(X_sample, y_sample)
+
+        if use_full_eval:
+            X_eval = X_bs
+            y_eval = y_bs
+        else:
+            eval_indices = np.setdiff1d(np.arange(len(X_bs)), bootstrap_indices)
+            X_eval = X_bs[eval_indices] if len(eval_indices) != 0 else X_bs
+            y_eval = y_bs[eval_indices] if len(eval_indices) != 0 else y_bs
+
+        preds = model.predict(X_eval)
+
+        if cls:
+            error = accuracy_score(y_eval, preds)
+        else:
+            r2_error = np.clip(r2_score(y_eval, preds), 0, 1)
+            error = r2_error
+
+        return {'model': model, 'error': error}
 
     def evaluate(self, model_names, num_target, n_bootstrap_sample_nums, cls=False, use_full_eval=False, cross_val=False):
         model_results = {}
@@ -168,13 +194,6 @@ class ModelEvaluator:
             stacking_model = StackingClassifier(estimators=base_models, final_estimator=meta_classifier, stack_method='predict_proba')
         else:
             stacking_model = StackingClassifier(estimators=base_models, final_estimator=meta_classifier) if cls else StackingRegressor(estimators=base_models, final_estimator=meta_classifier)
-
-        # X_meta = np.zeros((self.X_train.shape[0], len(base_models)))
-        # for i, (_, model) in enumerate(base_models):
-        #     if use_probas and cls:
-        #         X_meta[:, i] = model.predict_proba(self.X_train)[:, 1]
-        #     else:
-        #         X_meta[:, i] = model.predict(self.X_train)
 
         X_meta = self.X_train
         y_meta = self.y_train[:, num_target]

@@ -1,9 +1,23 @@
 import numpy as np
-import os, pickle, torch
+import os, pickle, torch, ray
 from scipy.stats import norm
 import pygmo as pg
 
 ### 所有内部优化问题的初始设置都是最大化
+
+if not ray.is_initialized():
+    ray.init(ignore_reinit_error=True)
+
+@ray.remote
+def model_predict(model, X_candidate, sg_model):
+    if sg_model == 'GaussianProcess':
+        Gmodel_res = model.model.posterior(torch.tensor(X_candidate, dtype=torch.float32))
+        Gmean = Gmodel_res.mean.detach().cpu().numpy().reshape(-1)
+        Gstd = torch.sqrt(Gmodel_res.variance).detach().cpu().numpy().reshape(-1)
+        return Gmean, Gstd
+    else:
+        preds = model.predict(X_candidate)
+        return preds, None
 
 class AcquisitionFunction:
     def __init__(self, hpar=0.1):
@@ -85,27 +99,27 @@ class AcquisitionFunction:
                     model_score = np.clip(score_mu-0.01*score_std, 0, np.inf)
                     # model_score = np.clip(score_mu, 0, np.inf)
 
+                tasks = []
+                for model in models:
+                    tasks.append(model_predict.remote(model, X_candidate, sg_model))
+
                 # make prediction using all bootstrapping generated models to get mean and std
+                results = ray.get(tasks)
                 preds = []
                 uncertains = []
-                for model in models:
-                    ### for Gaussian like models
+                for res in results:
                     if sg_model == 'GaussianProcess':
-                        Gmodel_res = model.model.posterior(torch.tensor(X_candidate, dtype=torch.float32))
-                        Gmean = Gmodel_res.mean.detach().cpu().numpy().reshape(-1)
-                        Gstd = torch.sqrt(Gmodel_res.variance).detach().cpu().numpy().reshape(-1)
-                        preds.append(Gmean)
-                        uncertains.append(Gstd)
+                        preds.append(res[0])
+                        uncertains.append(res[1])
                     else:
-                        preds.append(model.predict(X_candidate))
-                preds = np.array(preds)
+                        preds.append(res[0])
 
+                preds = np.array(preds)
                 if sg_model == 'GaussianProcess':
+                    # print(uncertains)
                     uncertains = np.array(uncertains)
                     mean = preds.mean(axis=0).reshape(-1)
                     std = uncertains.mean(axis=0).reshape(-1)
-                    # print(mean.shape, std.shape)
-                    # print(mean, std)
                 else:
                     mean = preds.mean(axis=0).reshape(-1)
                     std = preds.std(axis=0).reshape(-1)
@@ -129,6 +143,9 @@ class AcquisitionFunction:
                     raise ValueError(f"Unknown acquisition method: {method}")
 
                 acq_values += acq_value*model_score
+
+            if stack:
+                acq_values += stacking_model.predict(X_candidate)
                 
             all_acq_vaules.append(acq_values)
                   

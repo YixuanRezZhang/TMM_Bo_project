@@ -1,4 +1,4 @@
-import os
+import os, ray, multiprocessing
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -7,6 +7,15 @@ from src.surrogate_model import SurrogateModel, hyperparameter_optimization
 from src.evaluation import ModelEvaluator
 from src.acquisition_function import AcquisitionFunction
 from src.sampling import Sampler
+
+# try:
+#     multiprocessing.set_start_method('spawn', force=True)
+# except RuntimeError:
+#     pass
+
+if not ray.is_initialized():
+    ray.init()
+
 
 class BayesianOptimization:
     def __init__(self, data_file, target_props, feature_props=None, optimization_goal='maximize', scaler_method='standard', model_list=None, model_path=f'{os.getcwd()}/model_weights', stacking=False, acq_method='ucb', close_pool_initial_samples=10, close_pool_threshold=None):
@@ -33,7 +42,7 @@ class BayesianOptimization:
             select_index = max(int(len(self.y)*0.99), len(self.y)-50)
             self.close_pool_threshold = product[indexes][select_index].item()
             self.close_pool_init = product[indexes][int(len(self.y)*0.8)].item()
-        
+
 
     def close_pooling_test(self, n_bootstrap_sample_nums=20, n_iter=100, batch_size=10, hpar=0.1):
         
@@ -93,8 +102,9 @@ class BayesianOptimization:
                 print(f"Threshold {self.close_pool_threshold} reached at iteration {i+1}. The optimum target value is {current_best}")
                 break
 
+
     ### haven't tested yet
-    def optimize(self, batch_size=20, n_bootstrap_sample_nums=20, sampling_method='genetic_algorithm', num_candidate=100, n_samples=1000, iterations=30, hpar=0.1):
+    def optimize(self, batch_size=20, n_bootstrap_sample_nums=20, sampling_method='genetic_algorithm', num_candidate=100, n_samples=1000, iterations=30, hpar=0.1, lb=None, ub=None, all_surrogate_sampling=False):
 
         ## initializing
         print('Initialisation')
@@ -102,7 +112,7 @@ class BayesianOptimization:
         current_lb = np.min(self.y, axis=0)
         current_best = np.max(np.prod(y_train-current_lb, axis=1))
         
-        X_scaled, y_scaled = self.io_manager.standardize_data(X_train, y_train)
+        X_scaled, y_scaled = self.io_manager.standardize_data(X_train, y_train, feature_range=(0, 1), custom_min=None, custom_max=None)
         model_evaluator = ModelEvaluator(X_scaled, y_scaled, file_path=self.model_path)
         feature_dim = X_scaled.shape[1]
         sampler = Sampler(self.io_manager.scaler_X)
@@ -112,34 +122,20 @@ class BayesianOptimization:
         print('Fitting')
         target_model_res = {}
         for target_idx in range(y_train.shape[1]):
-            modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False)  # *** TBD: add the automatice column cls detection
+            # *** TBD: add the automatice column cls detection
+            if self.stacking:
+                modelres = model_evaluator.evaluate_with_stacking(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False)
+            else:
+                modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False)  
             target_model_res[target_idx] = modelres
 
-        ## Candidate generation 
+        ## Candidate generation
         print('Candidate generation')
-        candidate_X_scaled = []
-        for target_i in range(y_train.shape[1]):
-            for sg_model in self.model_list:
-                if target_model_res is None:
-                    print(f'load models {sg_model}_{target_i}')
-                    file_path = f"{model_path}/{sg_model}_{target_i}_bootstrap.pkl"
-                    with open(file_path, 'rb') as f:
-                        data = pickle.load(f)
-                    models = data['models']
-                    model_errors = data['model_errors']
-                else:
-                    models = target_model_res[target_i][sg_model]['model']
-                    model_errors = target_model_res[target_i][sg_model]['error']
-                    
-                for model in models:
-                    candidates = sampler.generate_candidates(sampling_method, model, feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations)
-                    candidate_X_scaled.append(candidates)
-                    
-        candidate_X_scaled = np.vstack(candidate_X_scaled)
+        candidate_X_scaled = sampler.generate_candidate_parallel(method=sampling_method, feature_dim=feature_dim, model_results=target_model_res, model_list=self.model_list, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=None, all_surrogate_sampling=all_surrogate_sampling, parallel=False)
 
         ## Candidate selection 
         print('Candidate selection')
-        next_indexes = acquisition_function.select_next(method=self.acq_method, X_candidate=candidate_X_scaled, model_name_list=self.model_list, num_target=y_train.shape[1], model_path=self.model_path, batch_size=batch_size, y_best=current_best)
+        next_indexes = acquisition_function.select_next(method=self.acq_method, X_candidate=candidate_X_scaled, model_name_list=self.model_list, num_target=y_train.shape[1], model_path=self.model_path, batch_size=batch_size, model_result=target_model_res, stack = self.stacking, y_best=current_best)
         samples_next = self.io_manager.inverse_transform_X(candidate_X_scaled[next_indexes])
         pd_samples_next = pd.DataFrame(samples_next)
         pd_samples_next.to_csv(f'{os.getcwd()}/suggested_samples.csv', index=False)

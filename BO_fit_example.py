@@ -214,15 +214,17 @@ elif method == 'BO_Turbo_bwo':
 else:
     fitting_results = ParamsFitting(fun_q).BO_Boosting()
 
-# save results
-csv_file = os.path.join(root_path, 'final_res.csv')
-data = {'index' + str(i): [fitting_results['X_best'][i]] for i in range(len(fitting_results['X_best']))}
-data['loss'] = [fitting_results['Best_value']]
-df = pd.DataFrame(data)
+fun_q.append_to_csv(root_path, fitting_results['X_best'], fitting_results['Best_value'], file_name='final_res.csv')
 
-if not os.path.isfile(csv_file):
-    df.to_csv(csv_file, index=False)
-else:
-    df.to_csv(csv_file, mode='a', header=False, index=False)
+# save results
+# csv_file = os.path.join(root_path, 'final_res.csv')
+# data = {'index' + str(i): [fitting_results['X_best'][i]] for i in range(len(fitting_results['X_best']))}
+# data['loss'] = [fitting_results['Best_value']]
+# df = pd.DataFrame(data)
+
+# if not os.path.isfile(csv_file):
+#     df.to_csv(csv_file, index=False)
+# else:
+#     df.to_csv(csv_file, mode='a', header=False, index=False)
 
 

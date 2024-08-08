@@ -300,9 +300,9 @@ class ParamsFittingExecuteModule:
         raise NotImplementedError
 
     ### can be applied to both single input or batch input
-    def append_to_csv(self, root_path, X_batch, y_batch, target_name='loss', feature_names=None):
+    def append_to_csv(self, root_path, X_batch, y_batch, target_name='loss', feature_names=None, file_name='Data/fit_res.csv'):
         # Define the CSV file path
-        csv_file = os.path.join(root_path, 'Data/fit_res.csv')
+        csv_file = os.path.join(root_path, file_name)
 
         if os.path.isfile(csv_file):
             existing_df = pd.read_csv(csv_file)

@@ -152,7 +152,7 @@ class TurboM(Turbo1):
 
     def _read_log(self):
      
-        data = pd.read_csv(self.file_path)
+        data = pd.read_csv(self.record_file)
         if self.target_column not in data.columns:
             raise ValueError(f"Target column '{self.target_column}' not found in the CSV file.")
         

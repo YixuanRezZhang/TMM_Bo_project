@@ -6,14 +6,14 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.bayesian_optimization import ParamsFitting, ParamsFittingIO, ParamsFittingExecuteModule
+from src.bayesian_optimization import ParamsFitting, PFIO, PFExecuteModule
 
 os.system('export OMP_NUM_THREADS=24')
 os.system('ulimit -v 48000000')
 
 root_path = os.getcwd()+'/'
 
-class IO(ParamsFittingIO):
+class IO(PFIO):
     
     def __init__(self, root_path, input_file_name='in.Quanty', output_file_name='out.Quanty', input_templates_file_name='10_RIXS_L23_M45.lua', target_file_name='Literature_value.Quanty'):
         self.root_path = root_path
@@ -72,7 +72,7 @@ class IO(ParamsFittingIO):
             outf.writelines(inl)
 
 
-class Execute_module(ParamsFittingExecuteModule):
+class Execute_module(PFExecuteModule):
     def __init__(self, dim=15, lb=None, ub=None):
         self.dim = dim
         self.lb = lb

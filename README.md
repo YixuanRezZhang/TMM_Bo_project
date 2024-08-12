@@ -27,5 +27,5 @@ install via:
     - ~~multiobjective: (fE, bg, mag)~~
     - ...
 - Testing on different parameter-fitting tasks:
-    - ~~RIXS~~
-    - ...
+    - RIXS
+    - HRTEM

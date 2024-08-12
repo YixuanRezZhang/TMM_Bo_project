@@ -16,7 +16,7 @@ import gpytorch
 import numpy as np
 import torch
 import random
-
+import pandas as pd
 from gpytorch.constraints.constraints import Interval
 from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.mlls import ExactMarginalLogLikelihood
@@ -257,7 +257,7 @@ class TurboM_bwo(Turbo1):
     
     def _read_log(self):
          
-        data = pd.read_csv(self.file_path)
+        data = pd.read_csv(self.record_file)
         if self.target_column not in data.columns:
             raise ValueError(f"Target column '{self.target_column}' not found in the CSV file.")
 

@@ -201,6 +201,7 @@ class TurboM(Turbo1):
                 fX_init = np.array([[self.f(x)] for x in X_init])
             
             # Update budget and set as initial data for this TR
+            
             self.X = np.vstack((self.X, X_init))
             self.fX = np.vstack((self.fX, fX_init))
             self._idx = np.vstack((self._idx, i * np.ones((len(X_init), 1), dtype=int)))

@@ -1,0 +1,7 @@
+paras_path:Test_results/TEMfitting_tests/example/para_results/initial_paras.txt
+simul_folder:Test_results/TEMfitting_tests/example/results_img/t22/task/img
+target_path:Test_results/TEMfitting_tests/example/target/real.dat
+script_path:Test_results/TEMfitting_tests/example/drp.sh
+results_path:Test_results/TEMfitting_tests/example/results_img/results2.txt
+nx:128
+ny:90

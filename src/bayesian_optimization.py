@@ -1,6 +1,9 @@
+import subprocess
 import os, ray
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 from src.io import IOManager
 from src.surrogate_model import SurrogateModel, hyperparameter_optimization
@@ -10,7 +13,7 @@ from src.sampling import Sampler
 from src.fast_fit.bwo import BWO
 from src.fast_fit.turbo import TurboM
 from src.fast_fit.turbo import TurboM_bwo
-
+from src.fast_fit.turbo.utils import from_unit_cube, latin_hypercube, to_unit_cube
 import torch
 from torch.quasirandom import SobolEngine
 from botorch.utils.transforms import normalize, unnormalize
@@ -251,8 +254,32 @@ class ParamsFitting:
         
         return {'X_best': x_best, 'Best_value': f_best[0]}
 
+def wasserstein_dis(x, y):
+    """
+    Compute the Wasserstein distance between two tensors.
+    
+    Args:
+        x (torch.Tensor): First input tensor.
+        y (torch.Tensor): Second input tensor.
+    
+    Returns:
+        torch.Tensor: Wasserstein distance between x and y.
+    """
+    X = x.cpu().numpy()
+    Y = y.cpu().numpy()
+
+    if X.ndim == 1:
+        wa_dist = wasserstein_distance(X, Y)
+    elif X.ndim >= 2:
+        wa_dist = wasserstein_distance_nd(X, Y)
+    else:
+        raise ValueError("Unsupported number of dimensions: {}".format(X.ndim))
+    
+    return wa_dist
+
+### User-defined classes
 ### Abstract IO and ExecuteModule for ParamsFitting
-class ParamsFittingIO:
+class PFIO:
     def __init__(self, root_path, input_file_name='in.lua', output_file_name='out.Quanty', input_templates_file_name='10_RIXS_L23_M45.lua', target_file_name='10_RIXS_L23_M45.Quanty'):
         self.root_path = root_path
         self.input_file_name = input_file_name
@@ -279,9 +306,8 @@ class ParamsFittingIO:
     ### modify the input file of ParamsFittingExecuteModule
     def modify_input(self, dict_para):
         raise NotImplementedError
-
 ### part for Executing simulation or experiment. This part will be act as 'func' parameter in the ParamsFitting
-class ParamsFittingExecuteModule:
+class PFExecuteModule:
     def __init__(self, dim=15, lb=None, ub=None):
         self.dim = dim
         self.lb = lb
@@ -301,6 +327,8 @@ class ParamsFittingExecuteModule:
 
     ### can be applied to both single input or batch input
     def append_to_csv(self, root_path, X_batch, y_batch, target_name='loss', feature_names=None, file_name='Data/fit_res.csv'):
+<<<<<<< HEAD
+=======
         # Define the CSV file path
         csv_file = os.path.join(root_path, file_name)
 
@@ -333,6 +361,265 @@ class ParamsFittingExecuteModule:
         else:
             # If the file exists, append the data without headers
             df.to_csv(csv_file, mode='a', header=False, index=False)
+    
+      
+class ParamsFittingIO:        
+    def __init__(self, input_file, loss_fun = 'mse'):
+        data = {}
+        with open(input_file, 'r') as file:
+            for line in file:
+                line = line.strip()
+                if ':' in line:
+                    key, value = line.split(':', 1)  # Split only on the first occurrence of ':'
+                    data[key.strip()] = value.strip()  # Strip any extra whitespace
+                else:
+                    print(f"Warning: Line '{line}' is not a valid key-value pair.")
+
+        self.paras_path = data['paras_path']
+        self.simul_folder = data['simul_folder']
+        self.target_path = data['target_path']
+        self.script_path = data['script_path']
+        self.results_path = data['results_path']
+        self.nx = int(data['nx'])
+        self.ny = int(data['ny'])
+        self.loss_fun = loss_fun
+    
+    def read_data(self,path):
+        
+        # Load data from file
+        data = np.fromfile(path, dtype='float32')
+
+        # Check the size of the data
+        data_size = data.size
+
+        # Case 1: nx * ny = data_size
+        if data_size == self.nx * self.ny:
+            reshaped_data = data.reshape((self.ny, self.nx))
+            return reshaped_data
+
+        # Case 2: 2 * nx * ny = data_size
+        elif data_size == 2 * self.nx * self.ny:
+            reshaped_data = np.fromfile(path, dtype='float64').reshape((self.ny, self.nx))
+            return reshaped_data
+
+        # Case 3: Other cases raise an error
+        else:
+             raise ValueError(f"Resolution error: data size ({data_size}) does not match.")
+    
+    def evaluate_true(self, device='cpu', dtype=torch.float64):
+        """
+        Evaluate the true function value given simulation and target paths.
+        Both the simulation files and the target file need to be saved in .dat format. 
+        The data in the file needs to be set to a one-dimensional data format for input.
+        
+        """
+        # Read and reshape the target and simulation data from files
+        target = self.read_data(self.target_path)
+        loss = []
+
+        # Loop through all files in the directory
+        for filename in os.listdir(self.simul_folder):
+            if filename.endswith('.dat'):
+                # Construct the full path to the file
+                simulation_path = os.path.join(self.simul_folder, filename)
+                simulation = self.read_data(simulation_path)
+                # print(simulation)
+
+                # Check if dimensions match
+                if target.shape != simulation.shape:
+                    raise ValueError(f"Dimension mismatch: target shape {target.shape} and simulation shape {simulation.shape} must be the same.")
+
+                # Convert the numpy arrays to torch tensors
+                y_real = torch.tensor(target, device=device, dtype=dtype)
+                y_fake = torch.tensor(simulation, device=device, dtype=dtype)
+
+                # Select the appropriate loss function
+                if self.loss_fun == "mse":
+                    Loss = -F.mse_loss(y_real, y_fake)
+                elif self.loss_fun == "l1_loss":
+                    Loss = -F.l1_loss(y_real, y_fake)
+                elif self.loss_fun == "cross_entropy":
+                    Loss = -F.cross_entropy(y_real, y_fake)
+                elif self.loss_fun == "binary_cross_entropy":
+                    Loss = -F.binary_cross_entropy(y_real, y_fake)
+                elif self.loss_fun == "kl_div":
+                    Loss = -F.kl_div(y_real, y_fake)
+                elif self.loss_fun == "wasserstein":
+                    Loss = -wasserstein_dis(y_real, y_fake)
+                elif self.loss_fun == "smooth_l1":
+                    Loss = -F.smooth_l1_loss(y_real,y_fake)
+                else:
+                    raise ValueError("Unsupported loss function: {}".format(self.loss_fun))
+                
+                # Append the computed loss to the list
+                
+                loss.append([Loss.cpu().numpy()])
+                
+
+        # Return the list of losses
+        return loss       
+    
+    def run_script(self):
+        """
+        Run a script based on its file extension.
+        
+        Parameters:
+        script_path (str): The path to the script to be executed.
+        
+        Returns:
+        dict: A dictionary with keys 'output', 'error', and 'returncode'.
+        """
+        # Get the file extension
+        _, file_extension = os.path.splitext(self.script_path)
+        
+        # Dictionary to map file extensions to the appropriate command
+        command_map = {
+            '.sh': ['bash'],
+            '.py': ['python3'],
+            '.pl': ['perl'],
+            '.rb': ['ruby'],
+            '.php': ['php'],
+            '.js': ['node'],
+            '.ps1': ['pwsh'],  # Assuming PowerShell Core is used on Linux
+            '.m': ['matlab', '-batch']
+        }
+        
+        # Check if the file extension is supported
+        if file_extension in command_map:
+            command = command_map[file_extension] + [self.script_path]
+        else:
+            return {
+                'output': '',
+                'error': f"Unsupported script type: {file_extension}",
+                'returncode': 1
+            }
+        
+        # Run the script
+        result = subprocess.run(command, capture_output=True, text=True)
+        
+        # Return the output, error, and return code
+        return {
+            'output': result.stdout,
+            'error': result.stderr,
+            'returncode': result.returncode
+        }
+    
+    def eval_objective(self):
+        """This is a helper function we use to unnormalize and evaluate a point"""
+         # Clear all files in the simul_folder
+        folder = self.simul_folder
+        for filename in os.listdir(folder):
+            file_path = os.path.join(folder, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)  # Remove the file
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)  # Remove the directory and its contents
+            except Exception as e:
+                print(f'Failed to delete {file_path}. Reason: {e}')
+        
+        process = self.run_script()
+        if process['returncode'] != 0:
+            print(process)
+            return None
+      
+        loss = self.evaluate_true()
+        loss = np.array(loss)
+        return loss
+                        
+    def write_paras(self, X):
+        # Clear the file by opening it in write mode
+        with open(self.paras_path, 'w') as f:
+            pass  # Opening in 'w' mode clears the file content
+        initial_paras = X
+        with open(self.paras_path, 'a') as f:
+            for value in initial_paras:
+                f.write(f"{value}\n")
+    
+    def write_data(self,result):
+        
+        if not os.path.exists(self.results_path):
+                # Create the file if it does not exist
+                with open(self.results_path, 'w') as file:
+                    pass  # Create an empty file
+                print(f"File created successfully: {self.results_path}")
+       
+        # Count the number of lines in the file
+        def count_lines(file_path):
+            try:
+                result = subprocess.run(['wc', '-l', file_path], capture_output=True, text=True, check=True)
+                line_count = int(result.stdout.split()[0])
+                return line_count
+            except subprocess.CalledProcessError as e:
+                print(f"An error occurred while counting lines: {e}")
+                return None
+        # Count lines and increment by 1
+        para_init = count_lines(self.results_path) + 1
+        stop_value = result['Best_value']
+        # Write data to the file
+        with open(self.results_path, 'a') as f:
+            f.write(f"{para_init}   {'_'.join([str(i.item()) for i in result['X_best']])}   {stop_value}   No_restart\n")
+
+    def append_to_csv(self, root_path, X_batch, y_batch, target_name='loss', feature_names=None, file_name='Data/fit_res.csv'):
+>>>>>>> a91cf54 (upload load)
+        # Define the CSV file path
+        csv_file = os.path.join(root_path, file_name)
+
+        if os.path.isfile(csv_file):
+            existing_df = pd.read_csv(csv_file)
+            existing_columns = existing_df.columns.tolist()
+            if target_name not in existing_columns:
+                raise ValueError(f"Missing target columns: {target_name}")
+            else:
+                feature_names = [col for col in existing_columns if col != target_name]
+
+        # Ensure X_batch and y_batch are 2D arrays
+        if X_batch.ndim == 1:
+            X_batch = np.expand_dims(X_batch, axis=0)
+
+        # Create a dictionary with column names and values
+        if feature_names is None:
+            feature_names = ['index' + str(i) for i in range(X_batch.shape[1])]
+
+        data = {feature_names[i]: X_batch[:, i] for i in range(X_batch.shape[1])}
+        data[target_name] = y_batch.reshape(-1)
+        
+        # Convert the dictionary to a DataFrame
+        df = pd.DataFrame(data)
+
+        # Check if the file exists
+        if not os.path.isfile(csv_file):
+            # If the file does not exist, create it with headers
+            df.to_csv(csv_file, index=False)
+        else:
+            # If the file exists, append the data without headers
+            df.to_csv(csv_file, mode='a', header=False, index=False)
+        
+### part for Executing simulation or experiment. This part will be act as 'func' parameter in the ParamsFitting
+class ParamsFittingExecuteModule:
+    
+    def __init__(self, dim, lb, ub, input_file, root_path, loss_fun = 'mse'):
+        
+        self.input_file = input_file
+        self.lb = lb
+        self.ub = ub
+        self.bounds = np.stack([self.lb, self.ub]) if lb is not None and ub is not None else None
+        self.dim = dim
+        self.loss_fun = loss_fun
+        self.n_init = 4*dim
+        self.root_path = root_path
+
+    def __call__(self,X):
+        IO = ParamsFittingIO(input_file=self.input_file)
+        # X_init = latin_hypercube(self.n_init, self.dim)
+        # X = from_unit_cube(X_init, self.lb, self.ub)
+        IO.write_paras(X)
+        loss = IO.eval_objective()
+        IO.append_to_csv(self.root_path, X, loss,target_name='loss')
+        return loss
+
+    ### can be applied to both single input or batch input
+    
 
 ### exapmle usage: 
 ### func = ParamsFittingExecuteModule(dim, lb, ub)

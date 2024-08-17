@@ -101,8 +101,7 @@ class ModelEvaluator:
         else:
             if model_name == 'GaussianProcess':
                 X_tr, X_te, y_tr, y_te = train_test_split(X_bs, y_bs, test_size=0.8)
-                model = SurrogateModel(model_name, optimized_params)
-                model.fit(X_tr, y_tr)
+                model.fit(X_tr, y_tr)                
                 preds = model.predict(X_te)
                 
                 if cls:
@@ -219,6 +218,7 @@ class ModelEvaluator:
 
     def evaluate_with_stacking(self, model_names, num_target, n_bootstrap_sample_nums, cls=False, use_full_eval=False, cross_val=False, meta_classifier=None, use_probas=False):
         model_results = self.evaluate(model_names, num_target, n_bootstrap_sample_nums, cls=cls, use_full_eval=use_full_eval, cross_val=cross_val)
+        # print(model_results.items())
         stacking_model, base_model_errors = self.train_stacking_model(model_results, num_target, cls=cls, meta_classifier=meta_classifier, use_probas=use_probas, model_name_list=model_names)
         model_results['stacking_error'] = base_model_errors
         model_results['stacking_model'] = stacking_model
@@ -226,3 +226,47 @@ class ModelEvaluator:
             pickle.dump(model_results, f)
         
         return model_results
+
+    def MT_train_stacking_model(self, model_names, corr_model_save_paths, n_bootstrap_sample_nums=20, num_target=0, cls=False, meta_classifier=None, use_probas=False):
+        n_samples = len(self.X_train)
+        model_results = {}
+        for model_name in model_names:
+            for path in corr_model_save_paths:
+                file_path = f"{path}/{model_name}_{num_target}_bootstrap.pkl"
+                with open(file_path, 'rb') as f:
+                    data = pickle.load(f)
+                model_results[f'{path[-1]}_{model_name}'] = data
+
+        # print(f'MT_mr')
+        # print(model_results.items())
+        base_models = [(model_name, AbstractSurrogateModel(model_name, model_info['models'])) for model_name, model_info in model_results.items()]
+        # print(base_models)
+
+        X_meta = self.X_train
+        y_meta = self.y_train[:, num_target]
+
+        model_tasks = []
+        for i in range(n_bootstrap_sample_nums):
+        
+            bootstrap_indices = np.random.choice(np.arange(n_samples), size=n_samples, replace=True)
+            X_sample = X_meta[bootstrap_indices]
+            y_sample = y_meta[bootstrap_indices]
+            
+            if meta_classifier is None:
+                meta_classifier = RandomForestClassifier() if cls else RandomForestRegressor()
+        
+            if use_probas and cls:
+                stacking_model = StackingClassifier(estimators=base_models, final_estimator=meta_classifier, stack_method='predict_proba')
+            else:
+                stacking_model = StackingClassifier(estimators=base_models, final_estimator=meta_classifier) if cls else StackingRegressor(estimators=base_models, final_estimator=meta_classifier)
+                
+            stacking_model.fit(X_sample, y_sample)
+            model_tasks.append(stacking_model)
+            
+        if not os.path.exists(f'{self.file_path}'):
+            os.mkdir(f'{self.file_path}')
+            
+        with open(f'{self.file_path}/correlated_stacking_results_{num_target}_bootstrap.pkl', 'wb') as f:
+            pickle.dump(model_tasks, f)
+    
+        return model_tasks

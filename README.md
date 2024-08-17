@@ -13,7 +13,11 @@ install via:
 
 ## To Do list
 
+<<<<<<< HEAD
 - ~~multi-objective,~~ multi-task and multi-fidelity implementation by @ZhiyuanLi1222
+=======
+- ~~multi-objective,~~ ~~multi-task~~ and multi-fidelity implementation by @ZhiyuanLi1222
+>>>>>>> 6db5fae (Initial commit to multi branch)
 - material compositions-to-descriptors processing
 - ~~automatized characterization (parameter fitting function)~~
 - ~~Ray parallel processing~~

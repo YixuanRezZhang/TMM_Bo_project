@@ -159,5 +159,125 @@ class AcquisitionFunction:
         next_indexes = np.argsort(sort_result)[::-1][:batch_size]
         
         return next_indexes
+    
+    def MF_predres(self, X_candidates, model_name_list, model_path, model_result=None, stack=False):
+
+    
+        cmean=[]
+        cstd=[]       
+        # Load models
+        if stack:
+            if model_result is None:
+                stack_file_path = f"{model_path}/stacking_results_0.pkl"
+                with open(stack_file_path, 'rb') as f:
+                    data = pickle.load(f)
+                stacking_model = data['stacking_model']
+                stacking_score = data['stacking_error']
+            else:
+                stacking_model = model_result['stacking_model']
+                stacking_score = model_result['stacking_error']
+                
+        
+        for sg_model in model_name_list:
+
+            if model_result is None:
+                print(f'load models {sg_model}_0')
+                file_path = f"{model_path}/{sg_model}_0_bootstrap.pkl"
+                with open(file_path, 'rb') as f:
+                    data = pickle.load(f)
+                # model_name = data['model_name']
+                # optimized_params = data['optimized_params']
+                models = data['models']
+                model_errors = [x for x in data['errors'] if np.isnan(x) == False]
+            else:
+                models = model_result[sg_model]['models']
+                model_errors = [x for x in model_result[sg_model]['errors'] if np.isnan(x) == False]
+
+            # design of score can be discussed. 
+            ### TBD:***maybe using a model ensemble score to direct represent score, thus a ensemble fitting should be added in evaluation.py***
+            if stack:
+                model_score = stacking_score[sg_model]
+            else:
+                score_mu, score_std = np.mean(model_errors), np.std(model_errors)
+                model_score = np.clip(score_mu-0.01*score_std, 0, np.inf)
+                # model_score = np.clip(score_mu, 0, np.inf)
+
+            # make prediction using all bootstrapping generated models to get mean and std
+            preds = []
+            uncertains = []
+            for model in models:
+                ### for Gaussian like models
+                if sg_model == 'GaussianProcess':
+                    Gmodel_res = model.model.posterior(torch.tensor(X_candidates, dtype=torch.float32))
+                    Gmean = Gmodel_res.mean.detach().cpu().numpy().reshape(-1)
+                    Gstd = torch.sqrt(Gmodel_res.variance).detach().cpu().numpy().reshape(-1)
+                    preds.append(Gmean)
+                    uncertains.append(Gstd)
+                else:
+                    preds.append(model.predict(X_candidates))
+            preds = np.array(preds)
+
+            if sg_model == 'GaussianProcess':
+                uncertains = np.array(uncertains)
+                mean = preds.mean(axis=0).reshape(-1)
+                std = uncertains.mean(axis=0).reshape(-1)
+                # print(mean.shape, std.shape)
+                # print(mean, std)
+            else:
+                mean = preds.mean(axis=0).reshape(-1)
+                std = preds.std(axis=0).reshape(-1)            
+            weighted_mean = mean*model_score
+            weighted_std = std*model_score
+            cmean.append(weighted_mean)
+            cstd.append(weighted_std)
+        # 将 cmean 和 cstd 转换为二维 NumPy 数组，以便进行逐行平均
+        cmean_array = np.array(cmean)
+        cstd_array = np.array(cstd)
+
+        # 对每一列（每行的不同元素）求平均，结果为长度等于 weighted_mean 的数组
+        cmean = np.mean(cmean_array, axis=0)
+        cstd = np.mean(cstd_array, axis=0)
+
+
+        return (cmean, cstd)
+
+    def BOfusion_select_next(self, method, X_candidate,HFidx_candidate,mean_tuple, std_tuple,cost,batch_size=10, y_best=None):
+        
+        std_tuple = [np.array(std) for std in std_tuple]
+
+        # 将标准差转换为方差
+        variance_tuple = [std**2 for std in std_tuple]
+        
+        # 计算加权平均的融合均值
+        weights = [1 / (var + 1e-10) for var in variance_tuple]  # 加一个小值避免除以零
+        fused_mean = np.sum([mean * weight for mean, weight in zip(mean_tuple, weights)], axis=0) / np.sum(weights, axis=0)
+        
+        # 计算融合后的方差
+        fused_variance = 1 / np.sum(weights, axis=0)
+        
+        # 将方差转换回标准差
+        fused_std = np.sqrt(fused_variance)
+
+        if method == 'ucb':
+            acq_value = self.ucb(fused_mean, fused_std)
+        elif method == 'ei' or method == 'pi':
+            if y_best is None:
+                raise ValueError(f"Unknown current best target value y_best, add current best target value if you want to use EI or PI")
+            if method == 'ei':
+                acq_value = self.ei(fused_mean, fused_std, y_best)
+            elif method == 'pi':
+                acq_value = self.pi(fused_mean, fused_std, y_best)
+        else:
+            raise ValueError(f"Unknown acquisition method: {method}")
+        
+        sort_result = acq_value.reshape(-1)
+        next_indexes = np.argsort(sort_result)[::-1][:batch_size]
+        original_indexes = HFidx_candidate[next_indexes]  # 从HFidx_candidate中获取原始索引
+        cost_std_tuple = tuple(arr / num for arr, num in zip(std_tuple, cost))
+        preferredlevelforall = np.argmax(cost_std_tuple, axis=0)
+        # 筛选与原始索引对应的首选保真度层次
+        preferredlevel = preferredlevelforall[next_indexes]
+
+        return original_indexes, preferredlevel
 
 

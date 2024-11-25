@@ -1,6 +1,6 @@
-import ray
+import ray, os
 if not ray.is_initialized():
-    ray.init(ignore_reinit_error=True)
+    ray.init(ignore_reinit_error=True, _temp_dir='/mnt/Database/Yixuan/tmp')
 
 import numpy as np
 import os, pickle, torch
@@ -10,6 +10,9 @@ from sklearn.linear_model import RidgeCV, LogisticRegression, RidgeClassifier, L
 from sklearn.ensemble import StackingRegressor, StackingClassifier, RandomForestClassifier, GradientBoostingClassifier, RandomForestRegressor, GradientBoostingRegressor
 from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin, clone
 from src.surrogate_model import SurrogateModel, hyperparameter_optimization
+
+#device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  ## CUDA not applicatble yet
+device = torch.device('cpu')
 
 
 class AbstractSurrogateModel(BaseEstimator, RegressorMixin):
@@ -24,6 +27,10 @@ class AbstractSurrogateModel(BaseEstimator, RegressorMixin):
             Gmean = Gmodel_res.mean.detach().cpu().numpy().reshape(-1)
             # Gstd = torch.sqrt(Gmodel_res.variance).detach().cpu().numpy().reshape(-1)
             return Gmean
+        elif self.model_name == 'KAN':
+            return model.model(torch.tensor(X, dtype=torch.float32, device=device)).detach().cpu().numpy().flatten()
+        elif self.model_name == 'FastKAN':
+            return model.model(torch.tensor(X, dtype=torch.float32, device=device)).detach().cpu().numpy().flatten()
         else:
             preds = model.predict(X)
             return preds

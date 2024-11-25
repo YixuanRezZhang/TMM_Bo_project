@@ -16,9 +16,12 @@ class IOManager:
             raise ValueError("Invalid method. Use 'standard' or 'minmax'.")
         self.scaler_y = StandardScaler()
 
-    def read_data(self, file_name, target_props, feature_props=None, descriptor_type='magpie', handle_null=True, drop_non_numeric=True):
+    def read_data(self, file_name, target_props, feature_props=None, drop_columns=None, descriptor_type='magpie', handle_null=True, drop_non_numeric=True):
         file_path = os.path.join(self.root, f'{file_name}')
         data = pd.read_csv(file_path)
+        if drop_columns is not None:
+            print(f"drop columns: {drop_columns}")
+            data = data.drop(columns=drop_columns)
 
         # 检查指定的列是否存在
         missing_cols = [col for col in target_props if col not in data.columns]
@@ -33,13 +36,14 @@ class IOManager:
             if not handle_null:
                 raise ValueError("Data contains null values. Please handle them or set handle_null to True.")
             else:
-                data = self.handle_null_values(data, target_props, drop_non_numeric=drop_non_numeric)
+                data, non_numeric_columns = self.handle_null_values(data, target_props, drop_non_numeric=drop_non_numeric)
         else:
-            data = self.handle_null_values(data, target_props, drop_non_numeric=drop_non_numeric)
+            data, non_numeric_columns = self.handle_null_values(data, target_props, drop_non_numeric=drop_non_numeric)
 
         # 如果没有指明feature_props, 使用除target外所有列
         if feature_props is None:
             feature_props = [col for col in data.columns if col not in target_props]
+            feature_props = [col for col in feature_props if col not in non_numeric_columns]
         print(f'used feature set: {feature_props}')
         
         # 检查指定的feature列是否存在
@@ -55,35 +59,72 @@ class IOManager:
 
         return X, y
 
-    def handle_null_values(self, data, target_props, drop_non_numeric):
-        # 处理target列的null值，通过删除包含null的行
-        for target in target_props:
-            if data[target].isnull().any():
-                data = data.dropna(subset=[target])
-            if drop_non_numeric and not pd.api.types.is_numeric_dtype(data[target]):
-                unique_values = data[target].nunique()
-                if unique_values == 2:
-                    data[target] = data[target].astype('category').cat.codes
-                else:
-                    raise ValueError(f"Target column {target} contains non-numeric data that cannot be converted to binary classification.")
+    def read_candidate_data(self, file_name, target_props, feature_props=None, descriptor_type='magpie', drop_non_numeric=True):
+        file_path = os.path.join(self.root, f'{file_name}')
+        data = pd.read_csv(file_path)
 
+        # 检查指定的列是否存在
+        missing_cols = [col for col in target_props if col not in data.columns]
+        if missing_cols:
+            raise ValueError(f"Missing columns: {missing_cols}")
+
+        target_props = list(set(target_props))  # Remove duplicates if any
+
+        data, non_numeric_columns = self.handle_null_values(data, target_props, drop_non_numeric=drop_non_numeric, if_train_data=False)
+
+        # 如果没有指明feature_props, 使用除target外所有列
+        if feature_props is None:
+            feature_props = [col for col in data.columns if col not in target_props]
+            feature_props = [col for col in feature_props if col not in non_numeric_columns]
+        print(f'used feature set: {feature_props}')
+        
+        # 检查指定的feature列是否存在
+        missing_feature_cols = [col for col in feature_props if col not in data.columns]
+        if missing_feature_cols:
+            raise ValueError(f"Missing feature columns: {missing_feature_cols}")
+
+        X = data[feature_props].to_numpy()
+
+        return X
+
+    def handle_null_values(self, data, target_props, drop_non_numeric, if_train_data=True):
+        # 处理target列的null值，通过删除包含null的行    
+        if if_train_data:
+            for target in target_props:
+                if data[target].isnull().any():
+                    data = data.dropna(subset=[target])   # 删除含有空值的行
+                    print(f'drop samples contains null properties: {target}')
+                if drop_non_numeric and not pd.api.types.is_numeric_dtype(data[target]): 
+                    unique_values = data[target].nunique() # 计算唯一值数量
+                    if unique_values == 2:
+                        data[target] = data[target].astype('category').cat.codes # 将分类数据转换为 0/1 编码
+                    else:
+                        # 如果不是二分类数据，抛出错误
+                        raise ValueError(f"Target column {target} contains non-numeric data that cannot be converted to binary classification.")
+        non_numeric_columns = []
         # 处理非target列的null值，通过删除包含null的行
         for column in data.columns:
-            if column not in target_props:
-                if data[column].isnull().any():
+            if column not in target_props: # 对于非目标列
+                if drop_non_numeric and not pd.api.types.is_numeric_dtype(data[column]):
+                    print(f'drop feature which is non numeric: {column}')
+                    data = data.drop(columns=[column]) # 直接删除非数值列
+                    # 记录非数值列列名
+                    non_numeric_columns.append(column)  
+                elif data[column].isnull().any(): # 处理空值
                     # print(f'drop feature column contains null: {column}')
-                    # data = data.drop(columns=[column])
-                    print(f'drop samples contains null: {column}')
-                    data = data.dropna(subset=[column])
-                elif drop_non_numeric and not pd.api.types.is_numeric_dtype(data[column]):
-                    print(f'drop non numeric column: {column}')
-                    data = data.drop(columns=[column])
+                    # data = data.drop(columns=[column]) # 直接删除非数值列
+                    print(f'drop samples contains null features: {column}')
+                    data = data.dropna(subset=[column]) # 删除含有空值的行
+        print(f'length of cleaned data: {len(data)}')
 
-        return data
+        return data, non_numeric_columns
 
-    def standardize_data(self, X, y=None, feature_range=(0, 1), custom_min=None, custom_max=None):
+    def standardize_data(self, X, y=None, cand_X=None, cand_y=None, feature_range=(0, 1), custom_min=None, custom_max=None):
         if self.method == 'standard':
-            X_scaled = self.scaler_X.fit_transform(X)
+            self.scaler_X.fit(X)
+            X_scaled = self.scaler_X.transform(X)
+            if cand_X is not None:
+                cand_X_scaled = self.scaler_X.transform(cand_X)
         elif self.method == 'minmax':
             self.scaler_X.feature_range = feature_range
             if custom_min is not None and custom_max is not None:
@@ -94,16 +135,31 @@ class IOManager:
                 scale_X = (feature_range[1] - feature_range[0]) / (custom_max - custom_min)
                 min_X = feature_range[0] - custom_min * scale_X
                 X_scaled = X * scale_X + min_X
+                if cand_X is not None:
+                    cand_X_scaled = cand_X * scale_X + min_X
             else:
-                X_scaled = self.scaler_X.fit_transform(X)
+                self.scaler_X.fit(X)
+                X_scaled = self.scaler_X.transform(X)
+                if cand_X is not None:
+                    cand_X_scaled = self.scaler_X.transform(cand_X)
         else:
             raise ValueError("Invalid method. Use 'standard' or 'minmax'.")
 
         if y is not None:
-            y_scaled = self.scaler_y.fit_transform(y)       
-            return X_scaled, y_scaled
-        else:
+            self.scaler_y.fit(y)
+            y_scaled = self.scaler_y.transform(y)
+            if cand_y is not None:
+                cand_y_scaled = self.scaler_y.transform(cand_y)
+
+        if y is None and cand_X is None and cand_y is None:
             return X_scaled
+        elif y is not None and cand_X is None and cand_y is None:
+            return X_scaled, y_scaled
+        elif y is not None and cand_X is not None and cand_y is None:
+            return X_scaled, y_scaled, cand_X_scaled
+        else:
+            return X_scaled, y_scaled, cand_X_scaled, cand_y_scaled
+
 
     def inverse_transform_X(self, X_scaled):
         return self.scaler_X.inverse_transform(X_scaled)

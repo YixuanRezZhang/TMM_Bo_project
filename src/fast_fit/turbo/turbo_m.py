@@ -152,7 +152,7 @@ class TurboM(Turbo1):
 
     def _read_log(self):
      
-        data = pd.read_csv(self.record_file)
+        data = pd.read_csv(self.file_path)
         if self.target_column not in data.columns:
             raise ValueError(f"Target column '{self.target_column}' not found in the CSV file.")
         
@@ -201,7 +201,6 @@ class TurboM(Turbo1):
                 fX_init = np.array([[self.f(x)] for x in X_init])
             
             # Update budget and set as initial data for this TR
-            
             self.X = np.vstack((self.X, X_init))
             self.fX = np.vstack((self.fX, fX_init))
             self._idx = np.vstack((self._idx, i * np.ones((len(X_init), 1), dtype=int)))

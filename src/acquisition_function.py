@@ -56,7 +56,7 @@ class AcquisitionFunction:
         
         return contri_rank + distances
 
-    def select_next(self, method, X_candidate, model_name_list, num_target, model_path, batch_size=10, y_best=None, model_result=None, stack=False):
+    def select_next(self, method, X_candidate, model_name_list, num_target, model_path, batch_size=10, y_best=None, model_result=None, stack=False, select_region=None):
 
         all_acq_vaules = []
                
@@ -76,6 +76,8 @@ class AcquisitionFunction:
                     
             acq_values = np.zeros(X_candidate.shape[0])
             for sg_model in model_name_list:
+
+                print(f"start {sg_model}")
 
                 if model_result is None:
                     print(f'load models {sg_model}_{target_i}')
@@ -129,6 +131,12 @@ class AcquisitionFunction:
                 # *** or calculate the acq of each terget first, then calculate the hypervolume of all acqs
                 # *** the differences between two approach in my mind are the first approach are more robust in find the candidate behaves better in all target, while the second one are more sensitive to the ones which maybe more outstanding in single target
                 # *** here we choose the second approach since it is logically easy to implement
+
+                if select_region is not None:
+                    print(f'region selection: {select_region}')
+                    mean = -np.abs(mean-np.mean(select_region))
+                    if y_best is not None:
+                        y_best = -np.abs(y_best-np.mean(select_region))
                 
                 if method == 'ucb':
                     acq_value = self.ucb(mean, std)
@@ -145,7 +153,12 @@ class AcquisitionFunction:
                 acq_values += acq_value*model_score
 
             if stack:
-                acq_values += stacking_model.predict(X_candidate)
+                print(f"start stacking model")
+                stack_res = stacking_model.predict(X_candidate)
+                if select_region is not None:
+                    print(f'region selection: {select_region}')
+                    stack_res = -np.abs(stack_res-np.mean(select_region))
+                acq_values += stack_res
                 
             all_acq_vaules.append(acq_values)
                   

@@ -45,8 +45,9 @@ class BayesianOptimization:
                 ray.init(_temp_dir=f'{os.getcwd()}/tmp')
 
         # Data reading and scaling
-        self.X, self.y = self.io_manager.read_data(data_file, target_props=target_props, feature_props=feature_props, handle_null=True, drop_non_numeric=True)
-        self.y = -self.y if self.optimization_goal == 'minimize' else self.y
+        if data_file is not None:
+            self.X, self.y = self.io_manager.read_data(data_file, target_props=target_props, feature_props=feature_props, handle_null=True, drop_non_numeric=True)
+            self.y = -self.y if self.optimization_goal == 'minimize' else self.y
         if candidate_file is not None:
             self.X_cand = self.io_manager.read_candidate_data(candidate_file, target_props=target_props, feature_props=feature_props, drop_non_numeric=True)
         else:

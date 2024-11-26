@@ -1,8 +1,7 @@
 import multiprocessing
-import ray, os
+import ray, os, logging
 import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin
-
 import numpy as np
 import ray
 import importlib
@@ -16,9 +15,6 @@ from sko.AFSA import AFSA
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from src.evaluation import AbstractSurrogateModel
 
-if not ray.is_initialized():
-    ray.init()
-### TBD: 检查模型模型从candidate_list中随机采样的功能和添加离散化采样函数
 
 def map_to_candidate_list(sample, candidate_list, used_indices=None, metric='euclidean'):
     """
@@ -158,7 +154,7 @@ class Sampler:
             search_space = new_samples
             # search_space = np.vstack((search_space, new_samples))
 
-        print(f'best_value: {best_value}')
+        logging.info(f'best_value: {best_value}')
         top_samples_arg = np.argsort(np.array(top_samples_values).reshape(-1))
         return np.array(top_samples)[top_samples_arg][:num_candidate]
 
@@ -179,7 +175,7 @@ class Sampler:
             
         ga = GA(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=generations, lb=lb, ub=ub)
         best_x, best_y = ga.run()
-        print(f'best_value: {best_y}')
+        logging.info(f'best_value: {best_y}')
 
         sorted_indices = np.argsort(ga.Y.reshape(-1))
         X_selected = ga.X[sorted_indices][:num_candidate*3]
@@ -197,8 +193,6 @@ class Sampler:
             
             current_top_values = -model.predict(current_top_samples).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
-            print(current_top_values)
-            print(candi_arg)
             X_selected = current_top_samples[candi_arg]
 
         return np.array(X_selected[:num_candidate])
@@ -220,7 +214,7 @@ class Sampler:
 
         pso = PSO(func=fitness_func, n_dim=feature_dim, pop=population_size, max_iter=iterations, lb=lb, ub=ub)
         best_x, best_y = pso.run()
-        print(f'best_value: {best_y}')
+        logging.info(f'best_value: {best_y}')
 
         sorted_indices = np.argsort(pso.Y.reshape(-1))
         X_selected = pso.X[sorted_indices][:num_candidate*3]
@@ -278,7 +272,7 @@ class Sampler:
             sa = SA(func=fitness_func, x0=x0, T_max=100, T_min=1e-9, L=iterations)
             sa.neighbor = neighbor_func  # Use custom neighbor function to ensure bounds
             best_x, best_y = sa.run()
-            print(f'best_value: {best_y}')
+            logging.info(f'best_value: {best_y}')
             samples.append(np.array(sa.best_x_history))
 
         _X_sel = np.vstack(samples)
@@ -320,7 +314,7 @@ class Sampler:
 
         aca = ACA_TSP(func=fitness_func, n_dim=feature_dim, size_pop=n_ants, max_iter=n_iterations, distance_matrix=np.random.rand(feature_dim, feature_dim))
         best_x, best_y = aca.run()
-        print(f'best_value: {best_y}')
+        logging.info(f'best_value: {best_y}')
 
         sorted_indices = np.argsort(aca.Y.reshape(-1))
         X_selected = aca.X[sorted_indices][:num_candidate*3]
@@ -357,7 +351,7 @@ class Sampler:
 
         de = DE(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=generations, lb=lb, ub=ub)
         best_x, best_y = de.run()
-        print(f'best_value: {best_y}')
+        logging.info(f'best_value: {best_y}')
 
         sorted_indices = np.argsort(de.Y.reshape(-1))
         X_selected = de.X[sorted_indices][:num_candidate*3]
@@ -395,7 +389,7 @@ class Sampler:
 
         ia = IA_TSP(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=generations, prob_mut=0.2, T=0.7, alpha=0.95)
         best_x, best_y = ia.run()
-        print(f'best_value: {best_y}')
+        logging.info(f'best_value: {best_y}')
 
         sorted_indices = np.argsort(ia.Y.reshape(-1))
         X_selected = ia.X[sorted_indices][:num_candidate*3]
@@ -433,7 +427,7 @@ class Sampler:
 
         afsa = AFSA(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=iterations, max_try_num=100, step=0.5, visual=0.3, q=0.98, delta=0.5)
         best_x, best_y = afsa.run()
-        print(f'best_value: {best_y}')
+        logging.info(f'best_value: {best_y}')
 
         sorted_indices = np.argsort(afsa.Y.reshape(-1))
         X_selected = afsa.X[sorted_indices][:num_candidate*3]
@@ -565,26 +559,3 @@ class Sampler:
         
         return candidate_X_scaled
 
-    
-
-# 示例用法
-# if __name__ == "__main__":
-#     class DummyModel(BaseEstimator, RegressorMixin):
-#         def fit(self, X, y):
-#             pass
-    
-#         def predict(self, X):
-#             return np.sum(X, axis=1)
-    
-#     # 创建一个样本数据集
-#     X = np.random.rand(100, 10)
-#     y = np.sum(X, axis=1)
-    
-#     scaler = StandardScaler().fit(X)  # 假设这里使用的是StandardScaler
-#     model = DummyModel()
-#     model.fit(X, y)
-    
-#     sampler = Sampler(scaler)
-#     feature_dim = X.shape[1]
-#     candidates = sampler.generate_candidates('genetic_algorithm', model, feature_dim, n_samples=100, num_candidate=10)
-#     print(candidates)

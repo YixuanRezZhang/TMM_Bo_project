@@ -1,11 +1,12 @@
-import os
+import os, pickle
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.exceptions import NotFittedError
+import logging
 
 class IOManager:
-    def __init__(self, root=None, method='standard'):
+    def __init__(self, root=None, method='standard', file_path=None):
         self.root = root if root else os.getcwd()
         self.method = method
         if method == 'standard':
@@ -15,12 +16,32 @@ class IOManager:
         else:
             raise ValueError("Invalid method. Use 'standard' or 'minmax'.")
         self.scaler_y = StandardScaler()
+        self.file_path = file_path if file_path is not None else f'{os.getcwd()}/model_weights'
+
+    def save_scalers(self, data_id):     
+        os.makedirs(self.file_path, exist_ok=True)
+        scaler_file = os.path.join(self.file_path, f"scaler{data_id}.pkl")
+        with open(scaler_file, "wb") as f:
+            pickle.dump({"scaler_X": self.scaler_X, "scaler_y": self.scaler_y}, f)
+        logging.info(f"scalers{data_id} saved to {self.file_path} directory.")
+
+    def load_scalers(self, data_id):
+        try:
+            scaler_file = os.path.join(self.file_path, f"scaler{data_id}.pkl")
+            with open(scaler_file, "rb") as f:
+                scalers = pickle.load(f)
+            self.scaler_X = scalers["scaler_X"]
+            self.scaler_y = scalers["scaler_y"]
+            logging.info(f"scalers{data_id} loaded from {self.file_path} directory.")
+        except FileNotFoundError:
+            raise FileNotFoundError(f"scalers{data_id} files not found in {self.file_path} directory or {self.file_path} directory not exists.")
 
     def read_data(self, file_name, target_props, feature_props=None, drop_columns=None, descriptor_type='magpie', handle_null=True, drop_non_numeric=True):
+        
         file_path = os.path.join(self.root, f'{file_name}')
         data = pd.read_csv(file_path)
         if drop_columns is not None:
-            print(f"drop columns: {drop_columns}")
+            logging.info(f"drop columns: {drop_columns}")
             data = data.drop(columns=drop_columns)
 
         # 检查指定的列是否存在
@@ -32,7 +53,7 @@ class IOManager:
 
         # Check for null values
         if data.isnull().values.any():
-            print(f'data contains null value!')
+            logging.info(f'data contains null value!')
             if not handle_null:
                 raise ValueError("Data contains null values. Please handle them or set handle_null to True.")
             else:
@@ -44,7 +65,7 @@ class IOManager:
         if feature_props is None:
             feature_props = [col for col in data.columns if col not in target_props]
             feature_props = [col for col in feature_props if col not in non_numeric_columns]
-        print(f'used feature set: {feature_props}')
+        logging.info(f'used feature set: {feature_props}')
         
         # 检查指定的feature列是否存在
         missing_feature_cols = [col for col in feature_props if col not in data.columns]
@@ -76,7 +97,7 @@ class IOManager:
         if feature_props is None:
             feature_props = [col for col in data.columns if col not in target_props]
             feature_props = [col for col in feature_props if col not in non_numeric_columns]
-        print(f'used feature set: {feature_props}')
+        logging.info(f'used feature set: {feature_props}')
         
         # 检查指定的feature列是否存在
         missing_feature_cols = [col for col in feature_props if col not in data.columns]
@@ -93,7 +114,7 @@ class IOManager:
             for target in target_props:
                 if data[target].isnull().any():
                     data = data.dropna(subset=[target])   # 删除含有空值的行
-                    print(f'drop samples contains null properties: {target}')
+                    logging.info(f'drop samples contains null properties: {target}')
                 if drop_non_numeric and not pd.api.types.is_numeric_dtype(data[target]): 
                     unique_values = data[target].nunique() # 计算唯一值数量
                     if unique_values == 2:
@@ -106,59 +127,85 @@ class IOManager:
         for column in data.columns:
             if column not in target_props: # 对于非目标列
                 if drop_non_numeric and not pd.api.types.is_numeric_dtype(data[column]):
-                    print(f'drop feature which is non numeric: {column}')
+                    logging.info(f'drop feature which is non numeric: {column}')
                     data = data.drop(columns=[column]) # 直接删除非数值列
                     # 记录非数值列列名
                     non_numeric_columns.append(column)  
                 elif data[column].isnull().any(): # 处理空值
-                    # print(f'drop feature column contains null: {column}')
+                    # logging.info(f'drop feature column contains null: {column}')
                     # data = data.drop(columns=[column]) # 直接删除非数值列
-                    print(f'drop samples contains null features: {column}')
+                    logging.info(f'drop samples contains null features: {column}')
                     data = data.dropna(subset=[column]) # 删除含有空值的行
-        print(f'length of cleaned data: {len(data)}')
+        logging.info(f'length of cleaned data: {len(data)}')
 
         return data, non_numeric_columns
 
-    def standardize_data(self, X, y=None, cand_X=None, cand_y=None, feature_range=(0, 1), custom_min=None, custom_max=None):
-        if self.method == 'standard':
-            self.scaler_X.fit(X)
-            X_scaled = self.scaler_X.transform(X)
+
+    def standardize_data(self, X=None, y=None, cand_X=None, cand_y=None, feature_range=(0, 1), custom_min=None, custom_max=None, if_train=False, data_id=None):
+        """
+        Standardize or scale data based on the chosen method (standard/minmax).
+        Args:
+            X: Training features (optional).
+            y: Training targets (optional).
+            cand_X: Candidate features for prediction (optional).
+            cand_y: Candidate targets for prediction (optional).
+            feature_range: Feature range for MinMaxScaler.
+            custom_min, custom_max: Custom scaling ranges for MinMaxScaler.
+            if_train: Flag to indicate whether it's training mode (default=False).
+        Returns:
+            Tuple of scaled inputs in the same order as provided.
+        """
+        assert not (X is None and y is None and cand_X is None and cand_y is None), \
+            "At least one of X, y, cand_X, or cand_y must be provided."
+    
+        # Initialize variables
+        X_scaled, y_scaled, cand_X_scaled, cand_y_scaled = None, None, None, None
+    
+        if if_train:
+            # Training mode: fit scalers and save them
+            if self.method == 'standard':
+                if X is not None:
+                    self.scaler_X.fit(X)
+                    X_scaled = self.scaler_X.transform(X)
+                if y is not None:
+                    self.scaler_y.fit(y)
+                    y_scaled = self.scaler_y.transform(y)
+            elif self.method == 'minmax':
+                self.scaler_X.feature_range = feature_range
+                if X is not None:
+                    self.scaler_X.fit(X)
+                    X_scaled = self.scaler_X.transform(X)
+                if y is not None:
+                    self.scaler_y.fit(y)
+                    y_scaled = self.scaler_y.transform(y)
+            else:
+                raise ValueError("Invalid method. Use 'standard' or 'minmax'.")
+
             if cand_X is not None:
                 cand_X_scaled = self.scaler_X.transform(cand_X)
-        elif self.method == 'minmax':
-            self.scaler_X.feature_range = feature_range
-            if custom_min is not None and custom_max is not None:
-                if len(custom_min) != X.shape[1] or len(custom_max) != X.shape[1]:
-                    raise ValueError("custom_min and custom_max must have the same dimensions as the features.")
-
-                # 计算缩放比例和偏移量
-                scale_X = (feature_range[1] - feature_range[0]) / (custom_max - custom_min)
-                min_X = feature_range[0] - custom_min * scale_X
-                X_scaled = X * scale_X + min_X
-                if cand_X is not None:
-                    cand_X_scaled = cand_X * scale_X + min_X
-            else:
-                self.scaler_X.fit(X)
-                X_scaled = self.scaler_X.transform(X)
-                if cand_X is not None:
-                    cand_X_scaled = self.scaler_X.transform(cand_X)
-        else:
-            raise ValueError("Invalid method. Use 'standard' or 'minmax'.")
-
-        if y is not None:
-            self.scaler_y.fit(y)
-            y_scaled = self.scaler_y.transform(y)
             if cand_y is not None:
                 cand_y_scaled = self.scaler_y.transform(cand_y)
-
-        if y is None and cand_X is None and cand_y is None:
-            return X_scaled
-        elif y is not None and cand_X is None and cand_y is None:
-            return X_scaled, y_scaled
-        elif y is not None and cand_X is not None and cand_y is None:
-            return X_scaled, y_scaled, cand_X_scaled
+    
+            # Save scalers after fitting
+            self.save_scalers(data_id)
         else:
-            return X_scaled, y_scaled, cand_X_scaled, cand_y_scaled
+            # Prediction mode: load scalers and transform data
+            self.load_scalers(data_id)
+    
+            if X is not None:
+                X_scaled = self.scaler_X.transform(X)
+            if y is not None:
+                y_scaled = self.scaler_y.transform(y)
+            if cand_X is not None:
+                cand_X_scaled = self.scaler_X.transform(cand_X)
+            if cand_y is not None:
+                cand_y_scaled = self.scaler_y.transform(cand_y)
+    
+        # Dynamically construct the return tuple based on input arguments
+        return_tuple = tuple(var for var in [X_scaled, y_scaled, cand_X_scaled, cand_y_scaled] if var is not None)
+    
+        # If there's only one element, return it directly
+        return return_tuple[0] if len(return_tuple) == 1 else return_tuple
 
 
     def inverse_transform_X(self, X_scaled):
@@ -172,29 +219,3 @@ class IOManager:
         df.to_csv(file_name, index=False)
 
 
-
-# Example usage
-if __name__ == "__main__":
-    io_manager = IOManager()
-
-    drop_props = ['prop_to_drop1', 'prop_to_drop2']  # Replace with actual column names
-    props = ['target_prop']  # Replace with actual target column name
-    file_name = 'data.csv'  # Replace with actual file name
-
-    X, y = io_manager.read_data(file_name, drop_props, props)
-
-    # StandardScaler
-    X_standard, y_standard = io_manager.standardize_data(X, y, method='standard')
-
-    # MinMaxScaler with feature range (0, 1) and custom min/max
-    custom_min = [0, -10, 0]  # Replace with actual custom min values matching feature dimensions
-    custom_max = [100, 50, 100]  # Replace with actual custom max values matching feature dimensions
-    X_minmax, y_minmax = io_manager.standardize_data(X, y, method='minmax', feature_range=(0, 1), custom_min=custom_min, custom_max=custom_max)
-
-    # Inverse transform y for both methods
-    y_inv_standard = io_manager.inverse_transform_y(y_standard, method='standard')
-    y_inv_minmax = io_manager.inverse_transform_y(y_minmax, method='minmax', custom_min=custom_min, custom_max=custom_max)
-
-    # Save predictions example
-    predictions = np.array([1.0, 2.0, 3.0])  # Replace with actual predictions
-    io_manager.save_predictions(predictions, 'predictions.csv')

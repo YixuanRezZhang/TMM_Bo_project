@@ -75,9 +75,7 @@ class SurrogateModel:
         if self.model_name is None or self.model_name not in models.keys():
             raise ValueError(f"Unknown model name: {self.model_name}")
         model_class = models.get(self.model_name)
-        # if self.model_name == 'KAN' or self.model_name == 'FastKAN':
-        #     return models[self.model_name]()
-        # else:
+
         return model_class(**self.params)
 
     def _initialize_gp_model(self):
@@ -85,15 +83,12 @@ class SurrogateModel:
 
     def _initialize_kan_model(self, **kwargs):
 
-        print(f'KAN params: {self.params}')
         # Dynamically configure width based on input/output dimensions
         feature_dim = self.params.get("feature_dim")  # Placeholder, dynamically assigned later
         target_dim = self.params.get("target_dim")  # Placeholder, dynamically assigned later
         hidden_layers = self.params.get("hidden_layers")  # Default: 2 hidden layers with 2 nodes each
         
         width = [feature_dim] + hidden_layers + [target_dim]
-
-        print(f"width: {width}")
         
         # Only keep the parameters that KAN explicitly requires
         kan_params = {
@@ -129,8 +124,6 @@ class SurrogateModel:
         hidden_layers = self.params.get("hidden_layers")  # Default: 2 hidden layers with 2 nodes each
     
         width = [feature_dim] + hidden_layers + [target_dim]
-
-        print(f'KAN params: {self.params}, {width}')
 
         kan_params = {
             "layers_hidden": width,
@@ -249,7 +242,7 @@ def hyperparameter_optimization(model_name, X_train, y_train, cls=False, n_trial
         elif model_name == 'FastKAN':
             params["feature_dim"] = trial.suggest_int("feature_dim", feature_dim, feature_dim)
             params["target_dim"] = trial.suggest_int("target_dim", target_dim, target_dim)
-            params['hidden_layers'] = trial.suggest_categorical('hidden_layers',  [[2], [4], [8], [2, 2], [4, 4], [8, 8], [16, 16]])
+            params['hidden_layers'] = trial.suggest_categorical('hidden_layers',  [[2], [4], [8], [2, 2], [4, 4], [8, 8]]) #, [16, 16]])
             params['num_grids'] = trial.suggest_int('num_grids', 4, 16)
             params['lr'] = trial.suggest_loguniform('lr', 1e-4, 1e-2)
             # params['steps'] = trial.suggest_int('steps', 500, 2000)
@@ -273,6 +266,5 @@ def hyperparameter_optimization(model_name, X_train, y_train, cls=False, n_trial
         return {}
 
     study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=20)
-    print(study.best_params)
+    study.optimize(objective, n_trials=20, n_jobs=-1)
     return study.best_params

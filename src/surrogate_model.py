@@ -148,6 +148,7 @@ class SurrogateModel:
         elif self.model_name in ['KAN', 'FastKAN']:
             self.params["feature_dim"] = X.shape[1]
             self.params["target_dim"] = 1 if len(y.shape) == 1 else y.shape[1]
+            print(f"KAN params: {self.params}")
             if self.model_name == 'KAN':
                 # self.model = self._initialize_kan_model(self.params)
                 X_tensor = torch.tensor(X, dtype=torch.float32, device=device)
@@ -243,7 +244,7 @@ def hyperparameter_optimization(model_name, X_train, y_train, cls=False, n_trial
             params["feature_dim"] = trial.suggest_int("feature_dim", feature_dim, feature_dim)
             params["target_dim"] = trial.suggest_int("target_dim", target_dim, target_dim)
             params['hidden_layers'] = trial.suggest_categorical('hidden_layers',  [[2], [4], [8], [2, 2], [4, 4], [8, 8]]) #, [16, 16]])
-            params['num_grids'] = trial.suggest_int('num_grids', 4, 16)
+            params['num_grids'] = trial.suggest_int('num_grids', 4, 12)
             params['lr'] = trial.suggest_loguniform('lr', 1e-4, 1e-2)
             # params['steps'] = trial.suggest_int('steps', 500, 2000)
 

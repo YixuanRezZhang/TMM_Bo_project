@@ -14,43 +14,83 @@ from sko.IA import IA_TSP
 from sko.AFSA import AFSA
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from src.evaluation import AbstractSurrogateModel
+from sklearn.neighbors import KDTree
+from scipy.spatial import distance
+import faiss
 
-
-def map_to_candidate_list(sample, candidate_list, used_indices=None, metric='euclidean'):
-    """
-    Map a sample to the nearest point in the candidate list based on the specified metric,
-    ensuring the result is not a duplicate of already selected points.
-    
-    Parameters:
-    - sample: ndarray of shape (n_features,), the sample to map.
-    - candidate_list: ndarray of shape (n_candidates, n_features), the candidate list.
-    - used_indices: set, indices of already selected points in the candidate list.
-    - metric: str, distance metric ('euclidean', 'manhattan', etc.).
-    
-    Returns:
-    - Mapped candidate point from the candidate list.
-    - Index of the selected point.
-    """
-    from scipy.spatial import distance
+# slow version
+def map_to_candidate_list_normal(samples, candidate_list, used_indices=None, metric='euclidean'):
 
     if used_indices is None:
         used_indices = set()
 
-    # Compute distances
-    if metric == 'euclidean':
-        distances = distance.cdist([sample], candidate_list, metric='euclidean').flatten()
-    elif metric == 'manhattan':
-        distances = distance.cdist([sample], candidate_list, metric='cityblock').flatten()
-    else:
-        raise ValueError(f"Unsupported distance metric: {metric}")
+    samples = [samples] if len(samples.shape) < 2 else samples
+
+    distances = distance.cdist(samples, candidate_list, metric=metric)
 
     # Set distances of already used points to infinity
     for idx in used_indices:
         distances[idx] = np.inf
 
-    # Find the nearest unused point
-    nearest_idx = np.argmin(distances)
-    return candidate_list[nearest_idx], nearest_idx
+    nearest_indices = np.argmin(distances, axis=1)
+    return candidate_list[nearest_indices], nearest_indices
+
+
+def map_to_candidate_list_slow(samples, candidate_list, used_indices=None, metric='euclidean'):
+
+    if used_indices is None:
+        used_indices = set()
+
+    tree = KDTree(candidate_list, metric=metric)
+
+    mask = np.ones(len(candidate_list), dtype=bool)
+    mask[list(used_indices)] = False
+
+    filtered_candidates = candidate_list[mask]
+    samples = [samples] if len(samples.shape) < 2 else samples
+
+    # Query nearest neighbors for all samples
+    dists, nearest_indices_in_filtered = tree.query(samples, k=1)
+    nearest_indices_in_filtered = nearest_indices_in_filtered.flatten()
+
+    # Map filtered indices back to original candidate indices
+    full_indices = np.arange(len(candidate_list))[mask]
+    nearest_indices = full_indices[nearest_indices_in_filtered]
+
+    return candidate_list[nearest_indices], nearest_indices
+
+def map_to_candidate_list(samples, candidate_list, used_indices=None, metric='euclidean'):
+
+    if used_indices is None:
+        used_indices = set()
+
+    if metric != 'euclidean':
+        raise ValueError("Faiss currently only supports 'euclidean' distance.")
+
+    # Create a mask for unused points
+    mask = np.ones(len(candidate_list), dtype=bool)
+    mask[list(used_indices)] = False
+    filtered_candidates = candidate_list[mask]
+
+    # Build the Faiss index
+    index = faiss.IndexFlatL2(filtered_candidates.shape[1])
+    index.add(filtered_candidates.astype(np.float32))
+
+    # Query nearest neighbors for all samples
+    samples = [samples] if len(samples.shape) < 2 else samples
+    _, nearest_indices_in_filtered = index.search(samples.astype(np.float32), k=1)
+    nearest_indices_in_filtered = nearest_indices_in_filtered.flatten()
+
+    # Map filtered indices back to original candidate indices
+    full_indices = np.arange(len(candidate_list))[mask]
+    nearest_indices = full_indices[nearest_indices_in_filtered]
+
+    return candidate_list[nearest_indices], nearest_indices
+
+
+
+# 'gaussian', 'bernoulli', 'monte_carlo', 'genetic_algorithm', 'particle_swarm', 'simulated_annealing', 'ant_colony', 'differential_evolution', 'immune_algorithm', 'artificial_fish_swarm'
+## suggested order based on test result: 'simulated_annealing', 'monte_carlo', 'genetic_algorithm', 'differential_evolution', 'particle_swarm', 'immune_algorithm', 'artificial_fish_swarm'
 
 class Sampler:
     def __init__(self, scaler):
@@ -120,13 +160,8 @@ class Sampler:
             sorted_indices = np.argsort(values.reshape(-1))
             top_indices = sorted_indices[:num_candidates_per_iteration]
             if candidate_list is not None:
-
-                current_top_samples = []
-                for sample in samples[top_indices]:
-                    mapped_sample, selected_idx = map_to_candidate_list(sample, candidate_list, used_indices)
-                    current_top_samples.append(mapped_sample)
-                    used_indices.add(selected_idx)  # 将选取的索引添加到已使用集合中
-                
+                current_top_samples, selected_idx = map_to_candidate_list(samples[top_indices], candidate_list, used_indices)
+                [used_indices.add(i) for i in selected_idx]
                 current_top_samples = np.array(current_top_samples)
                 current_top_values = -model.predict(current_top_samples).reshape(-1)
             else:
@@ -182,13 +217,9 @@ class Sampler:
         Y_selected = ga.Y[sorted_indices][:num_candidate*3]
         
         if candidate_list is not None:
-            # current_top_samples = np.array([map_to_candidate_list(sample, candidate_list) for sample in X_selected])
             used_indices = set()
-            current_top_samples = []
-            for sample in X_selected:
-                mapped_sample, selected_idx = map_to_candidate_list(sample, candidate_list, used_indices)
-                current_top_samples.append(mapped_sample)
-                used_indices.add(selected_idx)  # 将选取的索引添加到已使用集合中   
+            current_top_samples, selected_idx = map_to_candidate_list(X_selected, candidate_list, used_indices)
+            [used_indices.add(i) for i in selected_idx] 
             current_top_samples = np.array(current_top_samples)
             
             current_top_values = -model.predict(current_top_samples).reshape(-1)
@@ -221,13 +252,9 @@ class Sampler:
         Y_selected = pso.Y[sorted_indices][:num_candidate*3]
         
         if candidate_list is not None:
-            # current_top_samples = np.array([map_to_candidate_list(sample, candidate_list) for sample in X_selected])
             used_indices = set()
-            current_top_samples = []
-            for sample in X_selected:
-                mapped_sample, selected_idx = map_to_candidate_list(sample, candidate_list, used_indices)
-                current_top_samples.append(mapped_sample)
-                used_indices.add(selected_idx)  # 将选取的索引添加到已使用集合中   
+            current_top_samples, selected_idx = map_to_candidate_list(X_selected, candidate_list, used_indices)
+            [used_indices.add(i) for i in selected_idx]   
             current_top_samples = np.array(current_top_samples)
             current_top_values = -model.predict(current_top_samples).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
@@ -236,12 +263,10 @@ class Sampler:
         return np.array(X_selected[:num_candidate])
 
     ## SA cannot control boundary, modification needed
-    def simulated_annealing_sampling(self, model, feature_dim, iterations=1000, num_candidate=10, candidate_list=None):
+    def simulated_annealing_sampling(self, model, feature_dim, iterations=200, num_candidate=10, candidate_list=None):
         
         # iterations = (num_candidate//(2*iterations)+1)*iterations if iterations<num_candidate//2 else iterations
-        # SA_iter_nums = num_candidate//70+1
-        iterations = (num_candidate//(2*iterations)+1)*iterations if iterations<num_candidate//2 else iterations
-        SA_iter_nums = 1
+        SA_iter_nums = int(num_candidate/70)+1
 
         samples = []
         for SA_iter in range(SA_iter_nums):
@@ -277,22 +302,19 @@ class Sampler:
 
         _X_sel = np.vstack(samples)
         _Y_sel = -model.predict(_X_sel).reshape(-1)
+        print(f'select_sample_num: {len(_X_sel)}')
 
         if candidate_list is not None:
-            # current_top_samples = np.array([map_to_candidate_list(sample, candidate_list) for sample in _X_sel])
             used_indices = set()
-            current_top_samples = []
-            for sample in _X_sel:
-                mapped_sample, selected_idx = map_to_candidate_list(sample, candidate_list, used_indices)
-                current_top_samples.append(mapped_sample)
-                used_indices.add(selected_idx)  # 将选取的索引添加到已使用集合中   
+            current_top_samples, selected_idx = map_to_candidate_list(_X_sel, candidate_list, used_indices)
+            [used_indices.add(i) for i in selected_idx]   
             current_top_samples = np.array(current_top_samples)
             current_top_values = -model.predict(current_top_samples).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
             X_selected = current_top_samples[candi_arg]
         else:
             X_arg = np.argsort(_Y_sel.reshape(-1))
-            X_selected = X_selected[X_arg]
+            X_selected = _X_sel[X_arg]
 
         return np.array(X_selected[:num_candidate])
 
@@ -321,13 +343,9 @@ class Sampler:
         Y_selected = aca.Y[sorted_indices][:num_candidate*3]
 
         if candidate_list is not None:
-            # current_top_samples = np.array([map_to_candidate_list(sample, candidate_list) for sample in X_selected])
             used_indices = set()
-            current_top_samples = []
-            for sample in X_selected:
-                mapped_sample, selected_idx = map_to_candidate_list(sample, candidate_list, used_indices)
-                current_top_samples.append(mapped_sample)
-                used_indices.add(selected_idx)  # 将选取的索引添加到已使用集合中   
+            current_top_samples, selected_idx = map_to_candidate_list(X_selected, candidate_list, used_indices)
+            [used_indices.add(i) for i in selected_idx]
             current_top_samples = np.array(current_top_samples)
             current_top_values = -model.predict(current_top_samples).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
@@ -358,13 +376,9 @@ class Sampler:
         Y_selected = de.Y[sorted_indices][:num_candidate*3]
 
         if candidate_list is not None:
-            # current_top_samples = np.array([map_to_candidate_list(sample, candidate_list) for sample in X_selected])
             used_indices = set()
-            current_top_samples = []
-            for sample in X_selected:
-                mapped_sample, selected_idx = map_to_candidate_list(sample, candidate_list, used_indices)
-                current_top_samples.append(mapped_sample)
-                used_indices.add(selected_idx)  # 将选取的索引添加到已使用集合中   
+            current_top_samples, selected_idx = map_to_candidate_list(X_selected, candidate_list, used_indices)
+            [used_indices.add(i) for i in selected_idx]
             current_top_samples = np.array(current_top_samples)
             current_top_values = -model.predict(current_top_samples).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
@@ -396,13 +410,9 @@ class Sampler:
         Y_selected = ia.Y[sorted_indices][:num_candidate*3]
 
         if candidate_list is not None:
-            # current_top_samples = np.array([map_to_candidate_list(sample, candidate_list) for sample in X_selected])
             used_indices = set()
-            current_top_samples = []
-            for sample in X_selected:
-                mapped_sample, selected_idx = map_to_candidate_list(sample, candidate_list, used_indices)
-                current_top_samples.append(mapped_sample)
-                used_indices.add(selected_idx)  # 将选取的索引添加到已使用集合中   
+            current_top_samples, selected_idx = map_to_candidate_list(X_selected, candidate_list, used_indices)
+            [used_indices.add(i) for i in selected_idx]   
             current_top_samples = np.array(current_top_samples)
             current_top_values = -model.predict(current_top_samples).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
@@ -434,13 +444,9 @@ class Sampler:
         Y_selected = afsa.Y[sorted_indices][:num_candidate*3]
 
         if candidate_list is not None:
-            # current_top_samples = np.array([map_to_candidate_list(sample, candidate_list) for sample in X_selected])
             used_indices = set()
-            current_top_samples = []
-            for sample in X_selected:
-                mapped_sample, selected_idx = map_to_candidate_list(sample, candidate_list, used_indices)
-                current_top_samples.append(mapped_sample)
-                used_indices.add(selected_idx)  # 将选取的索引添加到已使用集合中   
+            current_top_samples, selected_idx = map_to_candidate_list(X_selected, candidate_list, used_indices)
+            [used_indices.add(i) for i in selected_idx] 
             current_top_samples = np.array(current_top_samples)
             current_top_values = -model.predict(current_top_samples).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
@@ -524,8 +530,9 @@ class Sampler:
             raise ValueError(f"Unknown sampling method: {method}")
 
     ### Parallel candidate generation
-    def generate_candidate_parallel(self, method, feature_dim, model_results, model_list, num_candidate=100, n_samples=1000, iterations=50, candidate_list=None, all_surrogate_sampling=False, parallel=True):
+    def generate_candidates_parallel(self, method, feature_dim, model_results, model_list, num_candidate=100, n_samples=1000, iterations=50, candidate_list=None):
 
+        candidate_list_ref = ray.put(candidate_list)
         candidate_tasks = []
         candidates = []
         for target_i in model_results.keys():
@@ -533,28 +540,10 @@ class Sampler:
                 models = model_results[target_i][sg_model]['models']
                 model_errors = model_results[target_i][sg_model]['errors']
 
-                if parallel:
-                    if all_surrogate_sampling:
-                        for model in models:
-                            candidate_tasks.append(self.generate_candidates_ray.remote(self, method=method, model=model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations))
-                    else:
-                        ensemble_model = AbstractSurrogateModel(sg_model, models)
-                        candidate_tasks.append(self.generate_candidates_ray.remote(self, method=method, model=ensemble_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations))
-                else:
-                    if all_surrogate_sampling:
-                        for model in models:
-                            candidate = self.generate_candidates(method=method, model=model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations)
-                            candidates.append(candidate)
-                    else:
-                        ensemble_model = AbstractSurrogateModel(sg_model, models)
-                        candidate = self.generate_candidates(method=method, model=ensemble_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations)
-                        candidates.append(candidate)
+                for model in models:
+                    candidate_tasks.append(self.generate_candidates_ray.remote(self, method=method, model=model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list_ref))
 
-        if parallel:
-            candidate_X_scaled = ray.get(candidate_tasks)  
-        else:
-            candidate_X_scaled = candidates
-            
+        candidate_X_scaled = ray.get(candidate_tasks)
         candidate_X_scaled = np.vstack(candidate_X_scaled)
         
         return candidate_X_scaled

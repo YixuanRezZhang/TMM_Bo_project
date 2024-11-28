@@ -9,9 +9,7 @@ import logging
 def model_predict(model, X_candidate, sg_model):
     if sg_model == 'GaussianProcess':
         Gmodel_res = model.model.posterior(torch.tensor(X_candidate, dtype=torch.float32))
-        Gmean = Gmodel_res.mean.detach().cpu().numpy().reshape(-1)
-        Gstd = torch.sqrt(Gmodel_res.variance).detach().cpu().numpy().reshape(-1)
-        return Gmean, Gstd
+        return Gmodel_res.mean.detach().cpu().numpy().reshape(-1), torch.sqrt(Gmodel_res.variance).detach().cpu().numpy().reshape(-1)
     else:
         preds = model.predict(X_candidate)
         return preds, None
@@ -73,6 +71,8 @@ class AcquisitionFunction:
                     stacking_score = model_result[target_i]['stacking_error']
                     
             acq_values = np.zeros(X_candidate.shape[0])
+            X_candidate_ref = ray.put(X_candidate)
+            
             for sg_model in model_name_list:
 
                 logging.info(f"start {sg_model}")
@@ -101,7 +101,7 @@ class AcquisitionFunction:
 
                 tasks = []
                 for model in models:
-                    tasks.append(model_predict.remote(model, X_candidate, sg_model))
+                    tasks.append(model_predict.remote(model, X_candidate_ref, sg_model))
 
                 # make prediction using all bootstrapping generated models to get mean and std
                 results = ray.get(tasks)
@@ -152,7 +152,7 @@ class AcquisitionFunction:
 
             if stack:
                 logging.info(f"start stacking model")
-                stack_res = stacking_model.predict(X_candidate)
+                stack_res = stacking_model.predict(X_candidate_ref)
                 if select_region is not None:
                     logging.info(f'region selection: {select_region}')
                     stack_res = -np.abs(stack_res-np.mean(select_region))
@@ -166,8 +166,10 @@ class AcquisitionFunction:
             sort_result = self.hypervolume(all_acq_vaules.T)
         else:
             sort_result = all_acq_vaules.reshape(-1)
-        
+
+        logging.info(f"start final sort")
         next_indexes = np.argsort(sort_result)[::-1][:batch_size]
+        logging.info(f"finish final sort")
         
         return next_indexes
 
@@ -175,8 +177,9 @@ class AcquisitionFunction:
 
         tasks = []                     
         acq_value = np.zeros(X_candidate.shape[0])
+        X_candidate_ref = ray.put(X_candidate)
         for model in Mainmodel_train:
-            tasks.append(model_predict.remote(model, X_candidate, sg_model=None))
+            tasks.append(model_predict.remote(model, X_candidate_ref, sg_model=None))
 
             # make prediction using all bootstrapping generated models to get mean and std
             results = ray.get(tasks)

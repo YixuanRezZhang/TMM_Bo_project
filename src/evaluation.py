@@ -78,32 +78,27 @@ class ModelEvaluator:
         models = []
         X_bs = self.X_train
         y_bs = self.y_train[:, num_target]
+        X_bs_ref = ray.put(X_bs)
+        y_bs_ref = ray.put(y_bs)
+        
         if n_bootstrap_sample_nums < 2:
             n_bootstrap_sample_nums = 2
         cv_n_splits = min(n_bootstrap_sample_nums, cv_n_splits)
 
         if cross_val:
+            cross_val_tasks = []
             kf = KFold(n_splits=cv_n_splits)
-            for train_idx, val_idx in kf.split(X_bs):
-                X_train_cv, X_val_cv = X_bs[train_idx], X_bs[val_idx]
-                y_train_cv, y_val_cv = y_bs[train_idx], y_bs[val_idx]
+            for train_idx, val_idx in kf.split(X_bs_ref):
+                cross_val_tasks.append(self._train_model.remote(self, model_name, optimized_params, X_bs_ref, y_bs_ref, train_idx, cls, use_full_eval))
 
-                model = SurrogateModel(model_name, optimized_params)
-                model.fit(X_train_cv, y_train_cv)
-                preds = model.predict(X_val_cv)
-
-                if cls:
-                    error = accuracy_score(y_val_cv, preds)
-                else:
-                    r2_error = np.clip(r2_score(y_val_cv, preds), 0, 1)
-                    error = r2_error
-
-                errors.append(error)
-                models.append(model)
-                
+            results = ray.get(bootstrap_tasks)
+            for res in results:
+                models.append(res['model'])
+                errors.append(res['error'])
+            
         else:
             if model_name == 'GaussianProcess':
-                X_tr, X_te, y_tr, y_te = train_test_split(X_bs, y_bs, test_size=0.8)
+                X_tr, X_te, y_tr, y_te = train_test_split(X_bs, y_bs_ref, test_size=0.8)
                 model = SurrogateModel(model_name, optimized_params)
                 model.fit(X_tr, y_tr)
                 preds = model.predict(X_te)
@@ -121,9 +116,7 @@ class ModelEvaluator:
                 bootstrap_tasks = []
                 for i in range(n_bootstrap_sample_nums):
                     bootstrap_indices = np.random.choice(np.arange(n_samples), size=n_samples, replace=True)
-                    X_sample = X_bs[bootstrap_indices]
-                    y_sample = y_bs[bootstrap_indices]
-                    bootstrap_tasks.append(self._train_model.remote(self, model_name, optimized_params, X_sample, y_sample, X_bs, y_bs, bootstrap_indices, cls, use_full_eval))
+                    bootstrap_tasks.append(self._train_model.remote(self, model_name, optimized_params, X_bs_ref, y_bs_ref, bootstrap_indices, cls, use_full_eval))
 
                 results = ray.get(bootstrap_tasks)
                 for res in results:
@@ -136,9 +129,10 @@ class ModelEvaluator:
         return [models, errors]
 
     @ray.remote
-    def _train_model(self, model_name, optimized_params, X_sample, y_sample, X_bs, y_bs, bootstrap_indices, cls, use_full_eval):
+    def _train_model(self, model_name, optimized_params, X_bs, y_bs, bootstrap_indices, cls, use_full_eval):
+
         model = SurrogateModel(model_name, optimized_params)
-        model.fit(X_sample, y_sample)
+        model.fit(X_bs[bootstrap_indices], y_bs[bootstrap_indices])
 
         if use_full_eval:
             X_eval = X_bs

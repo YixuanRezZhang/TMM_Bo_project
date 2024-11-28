@@ -170,7 +170,7 @@ class BayesianOptimization:
                     modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False)  
                 target_model_res[target_idx] = modelres
 
-            if len(candidate_X_scaled)>50000:
+            if len(candidate_X_scaled)>5000000:
                 logging.info('Candidate screening')
                 candi_X_scaled = sampler.generate_candidates_parallel(method=sampling_method, feature_dim=feature_dim, model_results=target_model_res, model_list=self.model_list, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_X_scaled)
             else:

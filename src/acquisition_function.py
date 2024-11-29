@@ -52,7 +52,7 @@ class AcquisitionFunction:
     
         points = -points
         if reference_point is None:
-            reference_point = np.max(points, axis=0) + 1
+            reference_point = np.max(points, axis=0) + 0.1
         else:
             reference_point = -reference_point
 

@@ -116,8 +116,8 @@ class BayesianOptimization:
             if close_pool_threshold is None:
                 if self.select_region is None:
                     # 1. 记录y每个性质的最大值和最小值，以便归一化
-                    self.min_vals = np.min(self.y, axis=0)
-                    self.max_vals = np.max(self.y, axis=0)
+                    self.min_vals = np.min(self.y, axis=0)-0.1
+                    self.max_vals = np.max(self.y, axis=0)+0.1
                     self.ranges = self.max_vals - self.min_vals
     
                     # 2. 对y的不同列进行归一化
@@ -146,8 +146,8 @@ class BayesianOptimization:
                 self.data_index = indexes
                 self.close_pool_init_threshold = product[indexes][select_index_init]
             else:
-                self.min_vals = np.min(self.y, axis=0)
-                self.max_vals = np.max(self.y, axis=0)
+                self.min_vals = np.min(self.y, axis=0)-0.1
+                self.max_vals = np.max(self.y, axis=0)+0.1
                 self.ranges = self.max_vals - self.min_vals
                 
                 normalized_y = (self.y - self.min_vals) / self.ranges

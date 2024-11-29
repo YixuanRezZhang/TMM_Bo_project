@@ -3,6 +3,7 @@ import os, pickle, torch, ray
 from scipy.stats import norm
 import pygmo as pg
 import logging
+# from ray.util.actor_pool import ActorPool
 ### 所有内部优化问题的初始设置都是最大化
 
 @ray.remote
@@ -13,6 +14,16 @@ def model_predict(model, X_candidate, sg_model):
     else:
         preds = model.predict(X_candidate)
         return preds, None
+
+@ray.remote
+def compute_pareto_front_batch(points_batch):
+    ud = pg.fast_non_dominated_sorting(points_batch.tolist())
+    return ud[0][0]
+
+def compute_hv_contributions(pareto_points, reference_point):
+    hv = pg.hypervolume(pareto_points)
+    return hv.contributions(reference_point)
+
 
 class AcquisitionFunction:
     def __init__(self, hpar=0.1):
@@ -37,19 +48,47 @@ class AcquisitionFunction:
             PI[std == 0.0] = 0.0
         return PI
 
-    # a contribution of hypervolume and Euclidean distance
-    def hypervolume(self, points, reference_point=None):
+    def hypervolume(self, points, reference_point=None, batch_size=50000, max_parallel_tasks=8):
+    
         points = -points
-        hv = pg.hypervolume(points)
         if reference_point is None:
-            reference_point = hv.refpoint()+1
+            reference_point = np.max(points, axis=0) + 1
         else:
             reference_point = -reference_point
 
-        contri_rank = hv.contributions(reference_point)
-        distances = np.linalg.norm(points - reference_point, axis=1)
+        num_points = len(points)
+        batches = [(i, min(i + batch_size, num_points)) for i in range(0, num_points, batch_size)]
+
+        # Step 1: Use Ray actor pool to compute local Pareto fronts
+        logging.info('Start local Pareto calculation')
+        ray_tasks = []
+        for start, end in batches:
+            batch = points[start:end]
+            ray_tasks.append(compute_pareto_front_batch.remote(batch))
+            del(batch)
+
+        pareto_batch_indices = ray.get(ray_tasks)
         
-        return contri_rank + distances
+        # Map batch indices back to global indices
+        logging.info('Start global Pareto calculation')
+        global_pareto_indices = []
+        for i, batch_indices in enumerate(pareto_batch_indices):
+            global_pareto_indices.extend(batch_indices + i * batch_size)
+        global_pareto_indices = list(set(global_pareto_indices))  # Deduplicate indices
+        global_pareto_points = points[global_pareto_indices]
+    
+        # Step 2: Compute hypervolume contributions for global Pareto front
+        logging.info('start hyper volume calculation')
+        hv_contributions = compute_hv_contributions(global_pareto_points, reference_point)
+        all_hv_contributions = np.zeros(num_points)  # Initialize to zero
+        all_hv_contributions[global_pareto_indices] = hv_contributions  # Assign contributions to Pareto points
+    
+        # Step 4: Calculate distances for all points
+        logging.info('start norm calculation')
+        distances = np.linalg.norm(points - reference_point, axis=1)
+
+        logging.info('finish hyper volume!')
+        return all_hv_contributions + distances
 
 
     def select_next(self, method, X_candidate, model_name_list, num_target, model_path, batch_size=10, y_best=None, model_result=None, stack=False, select_region=None):
@@ -75,7 +114,7 @@ class AcquisitionFunction:
             
             for sg_model in model_name_list:
 
-                logging.info(f"start {sg_model}")
+                logging.info(f"start {sg_model} {target_i}")
 
                 if model_result is None:
                     logging.info(f'load models {sg_model}_{target_i}')
@@ -132,9 +171,9 @@ class AcquisitionFunction:
 
                 if select_region is not None:
                     logging.info(f'region selection: {select_region}')
-                    mean = -np.abs(mean-np.mean(select_region))
+                    mean = -np.abs(mean-np.mean(select_region, axis=0)[target_i])
                     if y_best is not None:
-                        y_best = -np.abs(y_best-np.mean(select_region))
+                        y_best = -np.abs(y_best-np.mean(select_region, axis=0)[target_i])
                 
                 if method == 'ucb':
                     acq_value = self.ucb(mean, std)
@@ -151,16 +190,17 @@ class AcquisitionFunction:
                 acq_values += acq_value*model_score
 
             if stack:
-                logging.info(f"start stacking model")
+                logging.info(f"start stacking model {target_i}")
                 stack_res = stacking_model.predict(X_candidate_ref)
                 if select_region is not None:
                     logging.info(f'region selection: {select_region}')
-                    stack_res = -np.abs(stack_res-np.mean(select_region))
+                    stack_res = -np.abs(stack_res-np.mean(select_region, axis=0)[target_i])
                 acq_values += stack_res
                 
             all_acq_vaules.append(acq_values)
                   
         all_acq_vaules = np.array(all_acq_vaules)
+        logging.info(f'shape of {all_acq_vaules.shape}')
         
         if all_acq_vaules.shape[0]>1:
             sort_result = self.hypervolume(all_acq_vaules.T)

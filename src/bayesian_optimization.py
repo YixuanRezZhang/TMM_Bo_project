@@ -1,4 +1,4 @@
-import os, ray, pickle
+import os, ray, pickle, psutil, logging
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -7,7 +7,6 @@ from src.surrogate_model import SurrogateModel, hyperparameter_optimization
 from src.evaluation import ModelEvaluator
 from src.acquisition_function import AcquisitionFunction
 from src.sampling import Sampler
-import logging
 from datetime import datetime
 
 import torch
@@ -19,7 +18,70 @@ logging.basicConfig(
     filemode='a',
     format='%(asctime)s\t%(message)s',
     level=logging.INFO
+    # level=logging.DEBUG
 )
+
+def initialize_ray():
+    # 检查系统总内存
+    total_memory = psutil.virtual_memory().total  # 系统总内存
+    logging.info(f"Total system memory: {total_memory / (1024**3):.2f} GB")
+
+    # 检查 /dev/shm 的总大小和可用空间
+    shm_stats = psutil.disk_usage('/dev/shm')
+    shm_total = shm_stats.total  # 总共享内存大小
+    shm_available = shm_stats.free  # 可用共享内存空间
+    logging.info(f"/dev/shm total size: {shm_total / (1024**3):.2f} GB")
+    logging.info(f"/dev/shm available size: {shm_available / (1024**3):.2f} GB")
+
+    # 初始化时判断是否在 SLURM 环境下
+    if os.environ.get('SLURM_JOB_CPUS_PER_NODE') is not None:
+        logging.info('SLURM environment detected.')
+        
+        # 获取 SLURM 分配的资源
+        num_cpus = int(os.environ.get('SLURM_JOB_CPUS_PER_NODE'))
+        memory_per_cpu = int(os.environ.get('SLURM_MEM_PER_CPU')) * 1024 * 1024  # 单位：字节
+        total_slurm_memory = num_cpus * memory_per_cpu
+        
+        # 限制总内存为系统内存的 90%
+        if total_slurm_memory > int(total_memory * 0.9):
+            logging.warning('SLURM total_memory exceeds 90% system memory, adjusting to 90% system memory.')
+            total_slurm_memory = int(total_memory * 0.9)
+
+        # 动态设置 object_store_memory 和 _memory
+        object_store_memory = min(shm_available * 0.9, total_slurm_memory)  # Plasma 使用 /dev/shm 的 90%，或 SLURM 总内存的 50%
+        logging.info(f"Setting object_store_memory to {object_store_memory / (1024**3):.2f} GB")
+        logging.info(f"Setting _memory to {total_slurm_memory / (1024**3):.2f} GB")
+
+        # 设置 Ray 的临时目录
+        # selected_path = '/work/scratch/yz44maby/tmp/'  # 修改为 HPC 的临时路径
+        # timestamp = datetime.now().strftime("%H%M%S")
+        # ray_temp_dir = os.path.join(selected_path, f'ray_{timestamp}')
+        # os.makedirs(ray_temp_dir, exist_ok=True)
+
+        # 初始化 Ray
+        try:
+            ray.init(
+                num_cpus=num_cpus,
+                object_store_memory=int(object_store_memory),
+                _memory=int(total_slurm_memory),
+                # _temp_dir=ray_temp_dir,
+                logging_level=logging.INFO
+                # logging_level=logging.DEBUG
+            )
+            logging.info(f"Ray initialized successfully in SLURM: num_cpus={num_cpus}, memory_per_cpu={memory_per_cpu}, total_memory={total_slurm_memory}")
+        except Exception as e:
+            logging.error(f"Failed to initialize Ray in SLURM environment: {e}")
+            raise
+    else:
+        logging.info('No SLURM environment detected. Initializing Ray locally.')
+        try:
+            ray_temp_dir = os.path.join(os.getcwd(), 'tmp')
+            os.makedirs(ray_temp_dir, exist_ok=True)
+            ray.init(_temp_dir=ray_temp_dir, logging_level=logging.INFO)
+            logging.info("Ray initialized successfully in local mode.")
+        except Exception as e:
+            logging.error(f"Failed to initialize Ray in local environment: {e}")
+            raise
 
 class BayesianOptimization:
     def __init__(self, target_props, data_file=None, feature_props=None, optimization_goal='maximize', scaler_method='standard', model_list=None, model_path=f'{os.getcwd()}/model_weights', stacking=True, acq_method='ucb', candidate_file=None, close_pool=False, close_pool_initial_samples=10, close_pool_threshold=None, select_region=None):
@@ -35,22 +97,10 @@ class BayesianOptimization:
         self.acq_method = acq_method
         self.select_region = select_region
 
-        if not ray.is_initialized():
-            logging.info('initial ray')
-            if os.environ.get('SLURM_JOB_CPUS_PER_NODE') is not None:
-                num_cpus = int(os.environ.get('SLURM_JOB_CPUS_PER_NODE'))
-                memory_per_cpu = int(os.environ.get('SLURM_MEM_PER_CPU')) * 1024 * 1024
-                total_memory = num_cpus * memory_per_cpu
-                logging.info(f'please set your tmp dir path in ray.init when you submit HPC jobs')
-                selected_path = # '/path_to_your_HPC_scratch/tmp/'
-                timestamp = datetime.now().strftime("%H%M%S")
-                ray_temp_dir = os.path.join(selected_path, f'ray_{timestamp}')
-                os.makedirs(ray_temp_dir, exist_ok=True)
-                ray.init(num_cpus=num_cpus, _memory=total_memory, _temp_dir=ray_temp_dir)
-                logging.info(f'ray run in slurm: num_cpus: {num_cpus}; memory_per_cpu: {memory_per_cpu}; total_memory: {total_memory}')
-            else:
-                ray.init(_temp_dir=f'{os.getcwd()}/tmp')
-                logging.info(f'ray run in local')
+        try:
+            initialize_ray()
+        except Exception as e:
+            logging.error(f"Error during Ray initialization: {e}")
 
         # Data reading and scaling
         if data_file is not None:
@@ -136,7 +186,6 @@ class BayesianOptimization:
         candidate_indices = np.setdiff1d(np.arange(len(self.X)), train_indices)
     
         return self.X[train_indices], self.X[candidate_indices], self.y[train_indices], self.y[candidate_indices]
-
     
     def close_pooling_test(self, n_bootstrap_sample_nums=20, n_iter=100, batch_size=10, hpar=0.1, save_all_info=True, sampling_method='simulated_annealing', num_candidate=100, n_samples=200, iterations=30, lb=None, ub=None):
         

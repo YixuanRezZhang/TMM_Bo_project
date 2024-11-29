@@ -16,8 +16,9 @@ def model_predict(model, X_candidate, sg_model):
         return preds, None
 
 @ray.remote
-def compute_pareto_front_batch(points_batch):
-    ud = pg.fast_non_dominated_sorting(points_batch.tolist())
+def compute_pareto_front_batch(points_ref, start, end):
+    batch = points_ref[start:end]
+    ud = pg.fast_non_dominated_sorting(batch)
     return ud[0][0]
 
 def compute_hv_contributions(pareto_points, reference_point):
@@ -48,9 +49,10 @@ class AcquisitionFunction:
             PI[std == 0.0] = 0.0
         return PI
 
-    def hypervolume(self, points, reference_point=None, batch_size=50000, max_parallel_tasks=8):
+    def hypervolume(self, points, reference_point=None, batch_size=50000):
     
-        points = -points
+        points = -points #.astype(np.float32)
+        points_ref = ray.put(points)
         if reference_point is None:
             reference_point = np.max(points, axis=0) + 0.1
         else:
@@ -63,9 +65,7 @@ class AcquisitionFunction:
         logging.info('Start local Pareto calculation')
         ray_tasks = []
         for start, end in batches:
-            batch = points[start:end]
-            ray_tasks.append(compute_pareto_front_batch.remote(batch))
-            del(batch)
+            ray_tasks.append(compute_pareto_front_batch.remote(points_ref, start, end))
 
         pareto_batch_indices = ray.get(ray_tasks)
         
@@ -76,6 +76,8 @@ class AcquisitionFunction:
             global_pareto_indices.extend(batch_indices + i * batch_size)
         global_pareto_indices = list(set(global_pareto_indices))  # Deduplicate indices
         global_pareto_points = points[global_pareto_indices]
+        logging.info(f'global_pareto_indices: {global_pareto_indices}')
+        logging.info(f'global_pareto_points: {global_pareto_points}')
     
         # Step 2: Compute hypervolume contributions for global Pareto front
         logging.info('start hyper volume calculation')
@@ -209,6 +211,7 @@ class AcquisitionFunction:
 
         logging.info(f"start final sort")
         next_indexes = np.argsort(sort_result)[::-1][:batch_size]
+        # print(sort_result[next_indexes])
         logging.info(f"finish final sort")
         
         return next_indexes

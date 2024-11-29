@@ -30,6 +30,8 @@ def initialize_ray():
     shm_stats = psutil.disk_usage('/dev/shm')
     shm_total = shm_stats.total  # 总共享内存大小
     shm_available = shm_stats.free  # 可用共享内存空间
+    virtual_num_cpus = psutil.cpu_count(logical=False)
+    logging.info(f"Available CPUs: {virtual_num_cpus}")
     logging.info(f"/dev/shm total size: {shm_total / (1024**3):.2f} GB")
     logging.info(f"/dev/shm available size: {shm_available / (1024**3):.2f} GB")
 
@@ -41,6 +43,10 @@ def initialize_ray():
         num_cpus = int(os.environ.get('SLURM_JOB_CPUS_PER_NODE'))
         memory_per_cpu = int(os.environ.get('SLURM_MEM_PER_CPU')) * 1024 * 1024  # 单位：字节
         total_slurm_memory = num_cpus * memory_per_cpu
+        logging.info(f"SLURM INFO: num_cpus={num_cpus}, memory_per_cpu={memory_per_cpu}, total_memory={total_slurm_memory}")
+
+        if num_cpus!=virtual_num_cpus:
+            num_cpus = min(num_cpus, virtual_num_cpus)
         
         # 限制总内存为系统内存的 90%
         if total_slurm_memory > int(total_memory * 0.9):
@@ -48,7 +54,7 @@ def initialize_ray():
             total_slurm_memory = int(total_memory * 0.9)
 
         # 动态设置 object_store_memory 和 _memory
-        object_store_memory = min(shm_available * 0.9, total_slurm_memory)  # Plasma 使用 /dev/shm 的 90%，或 SLURM 总内存的 50%
+        object_store_memory = min(shm_available * 0.9, total_slurm_memory)  # Plasma 使用 /dev/shm 的 80%，或 total_slurm_memory
         logging.info(f"Setting object_store_memory to {object_store_memory / (1024**3):.2f} GB")
         logging.info(f"Setting _memory to {total_slurm_memory / (1024**3):.2f} GB")
 
@@ -116,8 +122,8 @@ class BayesianOptimization:
             if close_pool_threshold is None:
                 if self.select_region is None:
                     # 1. 记录y每个性质的最大值和最小值，以便归一化
-                    self.min_vals = np.min(self.y, axis=0)-0.1
-                    self.max_vals = np.max(self.y, axis=0)+0.1
+                    self.min_vals = np.min(self.y, axis=0)-0.001
+                    self.max_vals = np.max(self.y, axis=0)+0.001
                     self.ranges = self.max_vals - self.min_vals
     
                     # 2. 对y的不同列进行归一化
@@ -146,8 +152,8 @@ class BayesianOptimization:
                 self.data_index = indexes
                 self.close_pool_init_threshold = product[indexes][select_index_init]
             else:
-                self.min_vals = np.min(self.y, axis=0)-0.1
-                self.max_vals = np.max(self.y, axis=0)+0.1
+                self.min_vals = np.min(self.y, axis=0)-0.001
+                self.max_vals = np.max(self.y, axis=0)+0.001
                 self.ranges = self.max_vals - self.min_vals
                 
                 normalized_y = (self.y - self.min_vals) / self.ranges
@@ -219,7 +225,7 @@ class BayesianOptimization:
                     modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False)  
                 target_model_res[target_idx] = modelres
 
-            if len(candidate_X_scaled)>5000000:
+            if len(candidate_X_scaled)>10000000:
                 logging.info('Candidate screening')
                 candi_X_scaled = sampler.generate_candidates_parallel(method=sampling_method, feature_dim=feature_dim, model_results=target_model_res, model_list=self.model_list, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_X_scaled)
             else:

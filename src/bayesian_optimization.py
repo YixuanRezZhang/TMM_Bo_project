@@ -90,7 +90,7 @@ def initialize_ray():
             raise
 
 class BayesianOptimization:
-    def __init__(self, target_props, data_file=None, feature_props=None, optimization_goal='maximize', scaler_method='standard', model_list=None, model_path=f'{os.getcwd()}/model_weights', stacking=True, acq_method='ucb', candidate_file=None, close_pool=False, close_pool_initial_samples=10, close_pool_threshold=None, select_region=None):
+    def __init__(self, target_props, data_file=None, feature_props=None, optimization_goal='maximize', scaler_method='standard', model_list=None, model_path=f'{os.getcwd()}/model_weights', stacking=True, cross_val=False, acq_method='ucb', candidate_file=None, close_pool=False, close_pool_initial_samples=10, close_pool_threshold=None, select_region=None):
         self.data_file = data_file
         self.target_props = target_props
         self.feature_props = feature_props
@@ -100,6 +100,7 @@ class BayesianOptimization:
         self.model_list = model_list if model_list is not None else ['Ridge', 'Lasso', 'ElasticNet', 'KNeighborsRegressor', 'DecisionTreeRegressor', 'RandomForest', 'SVR', 'MLPRegressor', 'GradientBoostingRegressor', 'AdaBoostRegressor', 'ExtraTreesRegressor', 'XGBoost', 'LightGBM', 'GaussianProcess', 'FastKAN'] # 'LinearRegression' is deprecated
         self.model_path = model_path
         self.stacking = stacking
+        self.cross_val = cross_val
         self.acq_method = acq_method
         self.select_region = select_region
 
@@ -220,9 +221,9 @@ class BayesianOptimization:
             for target_idx in range(y_train.shape[1]):
                 # *** TBD: add the automatice column cls detection
                 if self.stacking:
-                    modelres = model_evaluator.evaluate_with_stacking(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False, cross_val=False)
+                    modelres = model_evaluator.evaluate_with_stacking(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False, cross_val=self.cross_val)
                 else:
-                    modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False, cross_val=False)  
+                    modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False, cross_val=self.cross_val)  
                 target_model_res[target_idx] = modelres
 
             if len(candidate_X_scaled)>10000000:
@@ -309,9 +310,9 @@ class BayesianOptimization:
             for target_idx in range(y_train.shape[1]):
                 # *** TBD: add the automatice column cls detection
                 if self.stacking:
-                    modelres = model_evaluator.evaluate_with_stacking(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False, cross_val=False)
+                    modelres = model_evaluator.evaluate_with_stacking(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False, cross_val=self.cross_val)
                 else:
-                    modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False, cross_val=False)
+                    modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False, cross_val=self.cross_val)
                 target_model_res[target_idx] = modelres
         else:
             target_model_res = None

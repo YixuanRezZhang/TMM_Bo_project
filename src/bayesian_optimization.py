@@ -220,9 +220,9 @@ class BayesianOptimization:
             for target_idx in range(y_train.shape[1]):
                 # *** TBD: add the automatice column cls detection
                 if self.stacking:
-                    modelres = model_evaluator.evaluate_with_stacking(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False)
+                    modelres = model_evaluator.evaluate_with_stacking(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False, cross_val=False)
                 else:
-                    modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False)  
+                    modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False, cross_val=False)  
                 target_model_res[target_idx] = modelres
 
             if len(candidate_X_scaled)>10000000:
@@ -309,9 +309,9 @@ class BayesianOptimization:
             for target_idx in range(y_train.shape[1]):
                 # *** TBD: add the automatice column cls detection
                 if self.stacking:
-                    modelres = model_evaluator.evaluate_with_stacking(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False)
+                    modelres = model_evaluator.evaluate_with_stacking(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False, cross_val=False)
                 else:
-                    modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False)  
+                    modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False, cross_val=False)
                 target_model_res[target_idx] = modelres
         else:
             target_model_res = None

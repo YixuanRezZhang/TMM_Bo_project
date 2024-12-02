@@ -88,17 +88,17 @@ class ModelEvaluator:
         if cross_val:
             cross_val_tasks = []
             kf = KFold(n_splits=cv_n_splits)
-            for train_idx, val_idx in kf.split(X_bs_ref):
+            for train_idx, val_idx in kf.split(X_bs):
                 cross_val_tasks.append(self._train_model.remote(self, model_name, optimized_params, X_bs_ref, y_bs_ref, train_idx, cls, use_full_eval))
 
-            results = ray.get(bootstrap_tasks)
+            results = ray.get(cross_val_tasks)
             for res in results:
                 models.append(res['model'])
                 errors.append(res['error'])
             
         else:
             if model_name == 'GaussianProcess':
-                X_tr, X_te, y_tr, y_te = train_test_split(X_bs, y_bs_ref, test_size=0.8)
+                X_tr, X_te, y_tr, y_te = train_test_split(X_bs, y_bs, test_size=0.8)
                 model = SurrogateModel(model_name, optimized_params)
                 model.fit(X_tr, y_tr)
                 preds = model.predict(X_te)

@@ -72,7 +72,7 @@ def initialize_ray():
             raise
 
         # 构建启动 Ray 的命令
-        ray_start_cmd = ['ray', 'start', '--head', f'--port={ray_port}', '--include-dashboard=False']
+        ray_start_cmd = ['ray', 'start', '--head', f'--port={ray_port}', f'--num-cpus={num_cpus}', f'--object-store-memory={object_store_memory}', '--include-dashboard=False']
 
         # 启动 Ray 头节点
         try:
@@ -105,8 +105,6 @@ def initialize_ray():
             ray.shutdown()
             ray.init(
                 address=f'127.0.0.1:{ray_port}',
-                num_cpus=num_cpus,
-                object_store_memory=int(object_store_memory),
                 _memory=int(total_slurm_memory),
                 include_dashboard=False,
                 # logging_level=logging.INFO

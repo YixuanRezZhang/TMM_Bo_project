@@ -12,6 +12,7 @@ from datetime import datetime
 import torch
 from torch.quasirandom import SobolEngine
 from botorch.utils.transforms import normalize, unnormalize
+import socket, subprocess, time
 
 logging.basicConfig(
     filename='bo.log',
@@ -20,6 +21,17 @@ logging.basicConfig(
     level=logging.INFO
     # level=logging.DEBUG
 )
+
+def is_port_available(port, host='127.0.0.1'):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        result = sock.connect_ex((host, port))
+        return result != 0  # 如果端口可用，返回 True
+
+def find_available_port(start_port=10000, end_port=65535, host='127.0.0.1'):
+    for port in range(start_port, end_port):
+        if is_port_available(port, host):
+            return port
+    raise RuntimeError("No available ports found.")
 
 def initialize_ray():
     # 检查系统总内存
@@ -36,45 +48,71 @@ def initialize_ray():
     logging.info(f"/dev/shm available size: {shm_available / (1024**3):.2f} GB")
 
     # 初始化时判断是否在 SLURM 环境下
-    if os.environ.get('SLURM_JOB_CPUS_PER_NODE') is not None:
+    if os.environ.get('SLURM_JOB_ID') is not None:
         logging.info('SLURM environment detected.')
         
         # 获取 SLURM 分配的资源
-        num_cpus = int(os.environ.get('SLURM_JOB_CPUS_PER_NODE'))
+        num_cpus = min(int(os.environ.get('SLURM_JOB_CPUS_PER_NODE')), int(os.environ.get('SLURM_NTASKS', 1)) * int(os.environ.get('SLURM_CPUS_PER_TASK', 1)))
         memory_per_cpu = int(os.environ.get('SLURM_MEM_PER_CPU')) * 1024 * 1024  # 单位：字节
         total_slurm_memory = num_cpus * memory_per_cpu
+
+        total_slurm_memory = min(total_slurm_memory, int(total_memory))
+        object_store_memory = int(min(shm_available * 0.8, total_slurm_memory))
+        num_cpus = min(num_cpus, virtual_num_cpus)
+
         logging.info(f"SLURM INFO: num_cpus={num_cpus}, memory_per_cpu={memory_per_cpu}, total_memory={total_slurm_memory}")
-
-        if num_cpus!=virtual_num_cpus:
-            num_cpus = min(num_cpus, virtual_num_cpus)
-        
-        # 限制总内存为系统内存的 90%
-        if total_slurm_memory > int(total_memory * 0.9):
-            logging.warning('SLURM total_memory exceeds 90% system memory, adjusting to 90% system memory.')
-            total_slurm_memory = int(total_memory * 0.9)
-
-        # 动态设置 object_store_memory 和 _memory
-        object_store_memory = min(shm_available * 0.9, total_slurm_memory)  # Plasma 使用 /dev/shm 的 80%，或 total_slurm_memory
         logging.info(f"Setting object_store_memory to {object_store_memory / (1024**3):.2f} GB")
-        logging.info(f"Setting _memory to {total_slurm_memory / (1024**3):.2f} GB")
 
-        # 设置 Ray 的临时目录
-        # selected_path = '/work/scratch/yz44maby/tmp/'  # 修改为 HPC 的临时路径
-        # timestamp = datetime.now().strftime("%H%M%S")
-        # ray_temp_dir = os.path.join(selected_path, f'ray_{timestamp}')
-        # os.makedirs(ray_temp_dir, exist_ok=True)
+        # 查找可用端口以启动 Ray 头节点
+        try:
+            ray_port = find_available_port(start_port=10000, end_port=11000)
+            logging.info(f'Found available port for Ray: {ray_port}')
+        except Exception as e:
+            logging.error(f'Failed to find available port: {e}')
+            raise
+
+        # 构建启动 Ray 的命令
+        ray_start_cmd = ['ray', 'start', '--head', f'--port={ray_port}', '--include-dashboard=False']
+
+        # 启动 Ray 头节点
+        try:
+            logging.info('Starting Ray head node...')
+            ray_process = subprocess.Popen(
+                ray_start_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+    
+            time.sleep(20)  # 根据需要调整等待时间
+    
+            # 检查 Ray 是否成功启动
+            stdout, stderr = ray_process.communicate(timeout=5)
+            if ray_process.returncode == 0:
+                logging.info('Ray head node started successfully.')
+            else:
+                logging.error(f'Ray failed to start. Return code: {ray_process.returncode}')
+                logging.error(f'STDOUT: {stdout}')
+                logging.error(f'STDERR: {stderr}')
+                raise RuntimeError('Failed to start Ray head node.')
+    
+        except Exception as e:
+            logging.error(f'Exception occurred while starting Ray: {e}')
+            raise
 
         # 初始化 Ray
         try:
+            ray.shutdown()
             ray.init(
+                address=f'127.0.0.1:{ray_port}',
                 num_cpus=num_cpus,
                 object_store_memory=int(object_store_memory),
                 _memory=int(total_slurm_memory),
-                # _temp_dir=ray_temp_dir,
-                logging_level=logging.INFO
-                # logging_level=logging.DEBUG
+                include_dashboard=False,
+                # logging_level=logging.INFO
+                logging_level=logging.DEBUG
             )
-            logging.info(f"Ray initialized successfully in SLURM: num_cpus={num_cpus}, memory_per_cpu={memory_per_cpu}, total_memory={total_slurm_memory}")
+            logging.info(f"Ray initialized successfully in SLURM: num_cpus={num_cpus}, object_store_memory={object_store_memory / (1024**3):.2f}")
         except Exception as e:
             logging.error(f"Failed to initialize Ray in SLURM environment: {e}")
             raise
@@ -83,7 +121,8 @@ def initialize_ray():
         try:
             ray_temp_dir = os.path.join(os.getcwd(), 'tmp')
             os.makedirs(ray_temp_dir, exist_ok=True)
-            ray.init(_temp_dir=ray_temp_dir, logging_level=logging.INFO)
+            ray.shutdown()
+            ray.init(_temp_dir=ray_temp_dir, include_dashboard=False, logging_level=logging.INFO)
             logging.info("Ray initialized successfully in local mode.")
         except Exception as e:
             logging.error(f"Failed to initialize Ray in local environment: {e}")

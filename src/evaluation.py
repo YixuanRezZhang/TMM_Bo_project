@@ -115,7 +115,7 @@ class ModelEvaluator:
             else:
                 bootstrap_tasks = []
                 for i in range(n_bootstrap_sample_nums):
-                    bootstrap_indices = np.random.choice(np.arange(n_samples), size=n_samples, replace=True)
+                    bootstrap_indices = np.random.choice(np.arange(n_samples), size=n_samples-2, replace=True)
                     bootstrap_tasks.append(self._train_model.remote(self, model_name, optimized_params, X_bs_ref, y_bs_ref, bootstrap_indices, cls, use_full_eval))
 
                 results = ray.get(bootstrap_tasks)

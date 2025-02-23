@@ -141,7 +141,7 @@ class IOManager:
         return data, non_numeric_columns
 
 
-    def standardize_data(self, X=None, y=None, cand_X=None, cand_y=None, feature_range=(0, 1), custom_min=None, custom_max=None, if_train=False, data_id=None):
+    def standardize_data(self, X=None, y=None, cand_X=None, cand_y=None, minmax_feature_range=(0, 1), if_train=False, data_id=None):
         """
         Standardize or scale data based on the chosen method (standard/minmax).
         Args:
@@ -149,8 +149,7 @@ class IOManager:
             y: Training targets (optional).
             cand_X: Candidate features for prediction (optional).
             cand_y: Candidate targets for prediction (optional).
-            feature_range: Feature range for MinMaxScaler.
-            custom_min, custom_max: Custom scaling ranges for MinMaxScaler.
+            minmax_feature_range: Feature range for MinMaxScaler.
             if_train: Flag to indicate whether it's training mode (default=False).
         Returns:
             Tuple of scaled inputs in the same order as provided.
@@ -171,7 +170,7 @@ class IOManager:
                     self.scaler_y.fit(y)
                     y_scaled = self.scaler_y.transform(y)
             elif self.method == 'minmax':
-                self.scaler_X.feature_range = feature_range
+                self.scaler_X.feature_range = minmax_feature_range
                 if X is not None:
                     self.scaler_X.fit(X)
                     X_scaled = self.scaler_X.transform(X)

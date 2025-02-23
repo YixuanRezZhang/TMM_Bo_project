@@ -127,7 +127,7 @@ def initialize_ray():
             raise
 
 class BayesianOptimization:
-    def __init__(self, target_props, data_file=None, feature_props=None, optimization_goal='maximize', scaler_method='standard', model_list=None, model_path=f'{os.getcwd()}/model_weights', stacking=True, cross_val=False, acq_method='ucb', candidate_file=None, close_pool=False, close_pool_initial_samples=10, close_pool_threshold=None, select_region=None):
+    def __init__(self, target_props, data_file=None, feature_props=None, optimization_goal='maximize', scaler_method='standard', model_list=None, model_path=f'{os.getcwd()}/model_weights', stacking=False, cross_val=False, acq_method='ucb', feature_lb=None, feature_ub=None, candidate_file=None, close_pool=False, close_pool_initial_samples=10, close_pool_threshold=None, select_region=None):
         self.data_file = data_file
         self.target_props = target_props
         self.feature_props = feature_props
@@ -140,6 +140,7 @@ class BayesianOptimization:
         self.cross_val = cross_val
         self.acq_method = acq_method
         self.select_region = select_region
+        self.feature_bounds = [feature_lb, feature_ub] if feature_lb is not None and feature_ub is not None else None
 
         try:
             initialize_ray()
@@ -231,7 +232,7 @@ class BayesianOptimization:
     
         return self.X[train_indices], self.X[candidate_indices], self.y[train_indices], self.y[candidate_indices]
     
-    def close_pooling_test(self, n_bootstrap_sample_nums=20, n_iter=100, batch_size=10, hpar=0.1, save_all_info=True, sampling_method='simulated_annealing', num_candidate=100, n_samples=200, iterations=30, lb=None, ub=None):
+    def close_pooling_test(self, n_bootstrap_sample_nums=20, n_iter=100, batch_size=10, hpar=0.1, save_all_info=True, sampling_method='genetic_algorithm', num_candidate=100, n_samples=200, iterations=30, candidate_sampling=False):
         
         logging.info(f'Threshold is {self.close_pool_threshold}, init_sampling threshold is {self.close_pool_init_threshold}')
         
@@ -249,9 +250,14 @@ class BayesianOptimization:
 
             X_scaled, y_scaled, candidate_X_scaled, candidate_y_scaled = self.io_manager.standardize_data(X_train, y_train, X_candidate, y_candidate, if_train=True, data_id=None)
 
+            if self.feature_bounds is not None:
+                scaled_feature_bounds = self.io_manager.scaler_X.transform(self.feature_bounds)
+            else:
+                scaled_feature_bounds = None
+
             select_region = self.io_manager.scaler_y.transform(self.select_region) if self.select_region is not None else self.select_region
             model_evaluator = ModelEvaluator(X_scaled, y_scaled, file_path=self.model_path)
-            sampler = Sampler(self.io_manager.scaler_X)
+            sampler = Sampler(self.io_manager.scaler_X, scaled_feature_bounds)
             feature_dim = X_scaled.shape[1]
             
             target_model_res = {}
@@ -263,13 +269,14 @@ class BayesianOptimization:
                     modelres = model_evaluator.evaluate(model_names=self.model_list, num_target=target_idx, n_bootstrap_sample_nums=n_bootstrap_sample_nums, cls=False, cross_val=self.cross_val)  
                 target_model_res[target_idx] = modelres
 
-            if len(candidate_X_scaled)>10000000:
+            if candidate_sampling:
                 logging.info('Candidate screening')
-                candi_X_scaled = sampler.generate_candidates_parallel(method=sampling_method, feature_dim=feature_dim, model_results=target_model_res, model_list=self.model_list, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_X_scaled)
+                _candi_X_scaled = sampler.generate_candidates_parallel(method=sampling_method, feature_dim=feature_dim, model_results=target_model_res, model_list=self.model_list, num_target=len(self.target_props), model_path=self.model_path, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_X_scaled)
+                candi_X_scaled = candidate_X_scaled[indice]
             else:
                 candi_X_scaled = candidate_X_scaled
-                
-            ### by adding the 'model_result' parameter, acquisition_function.select_next function can directly using the model saving in computer memory
+                ### by adding the 'model_result' parameter, acquisition_function.select_next function can directly using the model saving in computer memory
+            
             next_indexes = acquisition_function.select_next(method=self.acq_method, X_candidate=candi_X_scaled, model_name_list=self.model_list, num_target=y_train.shape[1], model_path=self.model_path, batch_size=batch_size, y_best=current_best, model_result=target_model_res, stack = self.stacking, select_region=select_region)
             
             ### if value of 'model_result' parameter is not provided, function will try to load the saved model from model_weight saving folder
@@ -305,7 +312,7 @@ class BayesianOptimization:
                     f.write(f"Threshold {self.close_pool_threshold} reached at iteration {i+1}. The optimum target value is {current_best}")
                 break
 
-    def optimize(self, batch_size=20, n_bootstrap_sample_nums=20, sampling_method='genetic_algorithm', num_candidate=100, n_samples=500, iterations=30, hpar=0.1, lb=None, ub=None, if_train=True, candidate_sampling=False):
+    def optimize(self, batch_size=20, n_bootstrap_sample_nums=20, sampling_method='genetic_algorithm', num_candidate=100, n_samples=100, iterations=200, hpar=0.1, if_train=True, candidate_sampling=False):
 
         ## initializing
         logging.info('Initialisation')
@@ -324,20 +331,25 @@ class BayesianOptimization:
         #current_best = np.max(np.prod(y_train-current_lb, axis=1))
         
         if self.X_cand is None:
-            X_scaled, y_scaled = self.io_manager.standardize_data(X=X_train, y=y_train, feature_range=(0, 1), custom_min=None, custom_max=None, if_train=True, data_id=None)
+            X_scaled, y_scaled = self.io_manager.standardize_data(X=X_train, y=y_train, minmax_feature_range=(0, 1), if_train=True, data_id=None)
         else:
             # X_cand = self.X_cand[:,1:]
             X_cand = self.X_cand[:,:]
-            X_scaled, y_scaled, cand_X_scaled = self.io_manager.standardize_data(X=X_train, y=y_train, cand_X=X_cand, feature_range=(0, 1), custom_min=None, custom_max=None, if_train=True, data_id=None)
+            X_scaled, y_scaled, cand_X_scaled = self.io_manager.standardize_data(X=X_train, y=y_train, cand_X=X_cand, minmax_feature_range=(0, 1), if_train=True, data_id=None)
 
         if self.select_region is not None:
             select_region = self.io_manager.scaler_y.transform(self.select_region)
         else:
             select_region = self.select_region
+
+        if self.feature_bounds is not None:
+            scaled_feature_bounds = self.io_manager.scaler_X.transform(self.feature_bounds)
+        else:
+            scaled_feature_bounds = None
         
         model_evaluator = ModelEvaluator(X_scaled, y_scaled, file_path=self.model_path)
         feature_dim = X_scaled.shape[1]
-        sampler = Sampler(self.io_manager.scaler_X)
+        sampler = Sampler(self.io_manager.scaler_X, scaled_feature_bounds)
         acquisition_function = AcquisitionFunction(hpar)
 
         ## Model fitting
@@ -357,10 +369,10 @@ class BayesianOptimization:
         ## Candidate generation
         if self.X_cand is None:
             logging.info('Candidate generation')
-            candidate_X_scaled = sampler.generate_candidates_parallel(method=sampling_method, feature_dim=feature_dim, model_results=target_model_res, model_list=self.model_list, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=None)
+            candidate_X_scaled = sampler.generate_candidates_parallel(method=sampling_method, feature_dim=feature_dim, model_results=target_model_res, model_list=self.model_list, num_target=len(self.target_props), model_path=self.model_path, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=None)
         elif candidate_sampling:
             logging.info('Candidate screening')
-            candidate_X_scaled = sampler.generate_candidates_parallel(method=sampling_method, feature_dim=feature_dim, model_results=target_model_res, model_list=self.model_list, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=cand_X_scaled)
+            candidate_X_scaled = sampler.generate_candidates_parallel(method=sampling_method, feature_dim=feature_dim, model_results=target_model_res, model_list=self.model_list, num_target=len(self.target_props), model_path=self.model_path, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=cand_X_scaled)
         else:
             candidate_X_scaled = cand_X_scaled
 

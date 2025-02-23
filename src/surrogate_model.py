@@ -140,9 +140,9 @@ class SurrogateModel:
     def fit(self, X, y):
         ### MaternKernel as an example, people can add more in the future follow this way
         if self.model_name == 'GaussianProcess':
-            covar_module = ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=X.shape[1], lengthscale_constraint=Interval(0.1, 4.0)))
+            # covar_module = ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=X.shape[1], lengthscale_constraint=Interval(0.1, 4.0)))
             outcome_transform = Standardize(m=1)
-            self.model = SingleTaskGP(torch.tensor(X, dtype=torch.float32, device=device), torch.tensor(y, dtype=torch.float32, device=device).unsqueeze(-1), outcome_transform=outcome_transform, covar_module=covar_module)
+            self.model = SingleTaskGP(torch.tensor(X, dtype=torch.float32, device=device), torch.tensor(y, dtype=torch.float32, device=device).unsqueeze(-1), outcome_transform=outcome_transform)#, covar_module=covar_module)
             mll = ExactMarginalLogLikelihood(self.model.likelihood, self.model)
             fit_gpytorch_mll(mll)
         elif self.model_name in ['KAN', 'FastKAN']:
@@ -221,7 +221,7 @@ def hyperparameter_optimization(model_name, X_train, y_train, cls=False, n_trial
             if model_name == 'ElasticNet':
                 params['l1_ratio'] = trial.suggest_uniform('l1_ratio', 0, 1)
         elif model_name == 'KNeighborsRegressor':
-            params['n_neighbors'] = trial.suggest_int('n_neighbors', 1, min(len(X_train), 50))
+            params['n_neighbors'] = trial.suggest_int('n_neighbors', 1, min(int(len(X_train)/2), 50))
         elif model_name == 'DecisionTreeRegressor':
             params['max_depth'] = trial.suggest_int('max_depth', 1, 64)
         elif model_name in ['GradientBoostingRegressor', 'AdaBoostRegressor', 'ExtraTreesRegressor']:

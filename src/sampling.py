@@ -13,10 +13,93 @@ from sko.DE import DE
 from sko.IA import IA_TSP
 from sko.AFSA import AFSA
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from src.evaluation import AbstractSurrogateModel
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.neighbors import KDTree
 from scipy.spatial import distance
 import faiss
+
+class RandomizedAbstractSurrogateModel(BaseEstimator, RegressorMixin):
+    def __init__(self, model_list, model_results, num_target, n_random_models=2, model_path=f'{os.getcwd()}/model_weights'):
+        self.model_list = model_list
+        self.n_random_models = n_random_models
+        self.num_target = num_target
+        
+        self.models = {}
+        for target_i in range(self.num_target):
+            self.models[target_i] = {}
+            model_score_lists = []
+            for modelname in model_list:
+                if model_results is None:
+                    file_path = f"{model_path}/{modelname}_{target_i}_bootstrap.pkl"
+                    with open(file_path, 'rb') as f:
+                        data = pickle.load(f)
+                    target_models = data['models']
+                    target_model_errors = data['errors']
+                else:
+                    target_models = model_results[target_i][modelname]['models']
+                    target_model_errors = model_results[target_i][modelname]['errors']
+                    
+                score_mu, score_std = np.mean(target_model_errors), np.std(target_model_errors)
+                model_score = np.clip(score_mu-0.01*score_std, 0.0000001, np.inf)
+                
+                self.models[target_i][modelname] = target_models
+                model_score_lists.append(model_score)
+
+            for count, modelname in enumerate(model_list):
+                self.models[target_i][f"{modelname}_score"] = model_score_lists[count]/sum(model_score_lists)
+                
+            logging.info(f'initialized RandomizedAbstractSurrogateModel')
+            
+            
+    @ray.remote
+    def small_model_predict(self, X, model):
+        return model.predict(X)
+    
+    @ray.remote
+    def model_predict(self, X, modelname, models, model_score):
+
+        if len(models) > self.n_random_models:
+            chosen_models = np.random.choice(models, size=self.n_random_models, replace=False)
+        else:
+            chosen_models = models
+        
+        if modelname == 'GaussianProcess':
+            result = []
+            for model in chosen_models:
+                Gmodel_res = model.model.posterior(torch.tensor(X, dtype=torch.float32))
+                Gmean = Gmodel_res.mean.detach().cpu().numpy().reshape(-1)
+                result.append(Gmean)
+            
+        elif modelname in ['KAN', 'FastKAN']:
+            result = []
+            for model in chosen_models:
+                res = model.model(torch.tensor(X, dtype=torch.float32, device=device)).detach().cpu().numpy().flatten()
+                result.append(res)
+            
+        else:
+            if len(chosen_models) <=1:
+                result = [model.predict(X) for model in chosen_models]
+            else:
+                result = ray.get([self.small_model_predict.remote(self, X, model) for model in chosen_models])
+
+        return np.mean(np.array(result), axis=0)*model_score
+
+    def fit(self, X, y):
+        pass  # 已经拟合好，不需要再 fit
+
+    def predict(self, X):
+        predictions = []
+        
+        for k in self.models.keys():
+    
+            pred = ray.get([self.model_predict.remote(self, X, modelname, self.models[k][modelname], self.models[k][f"{modelname}_score"]) for modelname in self.model_list])
+            pred = np.sum(np.array(pred), axis=0)
+            
+            predictions.append(pred)
+
+        result = np.sum(np.square(np.array(predictions)+3),axis=0)
+        logging.info(f'finish RandomizedAbstractSurrogateModel prediction')
+        return result
 
 # slow version
 def map_to_candidate_list_normal(samples, candidate_list, used_indices=None, metric='euclidean'):
@@ -88,13 +171,13 @@ def map_to_candidate_list(samples, candidate_list, used_indices=None, metric='eu
     return candidate_list[nearest_indices], nearest_indices
 
 
-
 # 'gaussian', 'bernoulli', 'monte_carlo', 'genetic_algorithm', 'particle_swarm', 'simulated_annealing', 'ant_colony', 'differential_evolution', 'immune_algorithm', 'artificial_fish_swarm'
 ## suggested order based on test result: 'simulated_annealing', 'monte_carlo', 'genetic_algorithm', 'differential_evolution', 'particle_swarm', 'immune_algorithm', 'artificial_fish_swarm'
 
 class Sampler:
-    def __init__(self, scaler):
+    def __init__(self, scaler, feature_bounds=None):
         self.scaler = scaler
+        self.feature_bounds = feature_bounds
 
     def gaussian_sampling(self, feature_dim, mean=None, std_dev=None, num_candidate=10):
         
@@ -117,100 +200,204 @@ class Sampler:
         #return bernoulli.rvs(p, size=num_candidate)
         return np.random.binomial(n_test, p, size=(num_candidate, feature_dim))
 
-    def levy_flight(self, Lambda):
+    def levy_flight(self, Lambda, size=1):
         """
-        Generate a step length for Levy flight using the Mantegna algorithm.
+        Generate step lengths for Levy flight using the Mantegna algorithm in a vectorized manner.
+        :param Lambda: The Levy exponent.
+        :param size: The number of steps to generate.
+        :return: A numpy array of step lengths.
         """
         sigma1 = np.power((np.math.gamma(1 + Lambda) * np.sin(np.pi * Lambda / 2)) /
                           (np.math.gamma((1 + Lambda) / 2) * Lambda * np.power(2, (Lambda - 1) / 2)), 1 / Lambda)
         sigma2 = 1
-        u = np.random.normal(0, sigma1)
-        v = np.random.normal(0, sigma2)
-        step = u / np.power(np.abs(v), 1 / Lambda)
-        return step
+        u = np.random.normal(0, sigma1, size)
+        v = np.random.normal(0, sigma2, size)
+        steps = u / np.power(np.abs(v), 1 / Lambda)
+        return steps
+
+
+    # def monte_carlo_sampling(self, model, feature_dim, n_samples=100, iterations=20, perturbation_scale=0.3, Lambda=1.5, num_candidate=100, candidate_list=None):
+    #     """
+    #     Monte Carlo optimization sampling with iterative improvement and Levy flight.
+    #     """
+
+    #     if self.feature_bounds is not None:
+    #         lb, ub = self.feature_bounds
+    #     elif isinstance(self.scaler, MinMaxScaler):
+    #         lb, ub = [0] * feature_dim, [1] * feature_dim
+    #     elif isinstance(self.scaler, StandardScaler):
+    #         lb, ub = [-9] * feature_dim, [9] * feature_dim  # Assuming 3 standard deviations as bounds
+    #     else:
+    #         lb, ub = None, None
+
+    #     if isinstance(self.scaler, MinMaxScaler):
+    #         search_space = np.clip(np.random.rand(n_samples, feature_dim),lb,ub)
+    #     else:
+    #         search_space = np.clip(np.random.randn(n_samples, feature_dim),lb,ub)
+
+    #     if n_samples*iterations < num_candidate:
+    #         raise ValueError("Total sampling points must be greater than num_candidate")
+
+    #     best_sample = None
+    #     top_samples = []
+    #     top_samples_values = []
+    #     used_indices = set()  # 用于记录已选择的候选点索引
+        
+    #     num_candidates_per_iteration = max(int(num_candidate/iterations)+1, int(n_samples/10)+1)
+        
+    #     for iteration in range(iterations):
+    #         # samples = search_space[np.random.choice(search_space.shape[0], n_samples, replace=False)]
+    #         samples = search_space
+    #         values = -model.predict(samples).reshape(-1)   # default optimization in sko is minimize, thus '-model'
+
+    #         best_value = values[0]
+        
+    #         sorted_indices = np.argsort(values.reshape(-1))
+    #         top_indices = sorted_indices[:num_candidates_per_iteration]
+
+    #         # if candidate_list is not None:
+    #         #     current_top_samples, selected_idx = map_to_candidate_list(samples[top_indices], candidate_list, used_indices)
+    #         #     [used_indices.add(i) for i in selected_idx]
+    #         #     current_top_samples = np.array(current_top_samples)
+    #         #     current_top_values = -model.predict(current_top_samples).reshape(-1)
+    #         # else:
+    #         current_top_samples = samples[top_indices]
+    #         current_top_values = values[top_indices]
+
+    #         if best_sample is None:
+    #             best_sample = current_top_samples[np.argmin(current_top_values)]
+    #         if min(current_top_values).item() < best_value:
+    #             best_sample = current_top_samples[np.argmin(current_top_values)]
+
+    #         top_samples.extend(current_top_samples)
+    #         top_samples_values.extend(current_top_values)
+        
+    #         print(f"iter {iteration} top 10 values: {np.array(current_top_values)[np.argsort(current_top_values.reshape(-1))[:10]]}")
+            
+    #         # candi_samples = [[best_sample]]
+    #         # current_top_indices = [0]+list(np.random.choice(np.arange(1,num_candidates_per_iteration), size=4, replace=False))
+    #         # for i in current_top_indices:
+    #         steps = self.levy_flight(Lambda, size=(n_samples, feature_dim)) * perturbation_scale
+    #         indices = np.random.randint(len(current_top_samples), size=n_samples)
+    #         random_top_samples = current_top_samples[indices]
+    #         new_samples = (best_sample + random_top_samples) / 2 + steps * np.random.randn(n_samples, feature_dim)
+    #         new_samples = np.clip(new_samples, lb, ub)
+        
+    #         search_space = np.vstack(([best_sample], new_samples))
+
+    #     # values = -model.predict(search_space).reshape(-1)
+    #     # if candidate_list is not None:
+    #     #     # final_top_samples = np.array(candidate_list[list(used_indices)])
+    #     # else:
+    #     final_top_samples = top_samples
+            
+    #     final_top_values = -model.predict(final_top_samples).reshape(-1)
+    #     final_samples_arg = np.argsort(np.array(final_top_values).reshape(-1))
+    #     logging.info(f'best_value: {final_top_values[final_samples_arg[:10]]}')
+
+    #     if candidate_list is not None:
+    #         final_samples, selected_idx = map_to_candidate_list(np.array(final_top_samples)[final_samples_arg][:num_candidate], candidate_list, used_indices)
+    #         return final_samples, selected_idx
+    #     else:
+    #         return np.array(final_top_samples)[final_samples_arg][:num_candidate]
 
     def monte_carlo_sampling(self, model, feature_dim, n_samples=100, iterations=20, perturbation_scale=0.3, Lambda=1.5, num_candidate=100, candidate_list=None):
         """
         Monte Carlo optimization sampling with iterative improvement and Levy flight.
         """
 
-        if isinstance(self.scaler, MinMaxScaler):
-            search_space = np.random.rand(n_samples, feature_dim)
+        if self.feature_bounds is not None:
+            lb, ub = self.feature_bounds
+        elif isinstance(self.scaler, MinMaxScaler):
+            lb, ub = [0] * feature_dim, [1] * feature_dim
         elif isinstance(self.scaler, StandardScaler):
-            search_space = np.random.randn(n_samples, feature_dim)
+            lb, ub = [-9] * feature_dim, [9] * feature_dim  # Assuming 3 standard deviations as bounds
         else:
-            raise ValueError("Unsupported scaler type")
+            lb, ub = None, None
 
-        if n_samples*iterations < num_candidate:
-            raise ValueError("Total sampling points must be greater than num_candidate")
+        if isinstance(self.scaler, MinMaxScaler):
+            search_space = np.clip(np.random.rand(n_samples, feature_dim),lb,ub)
+        else:
+            search_space = np.clip(np.random.randn(n_samples, feature_dim),lb,ub)
+
+        if n_samples < num_candidate:
+            raise ValueError("n_samples must be greater than num_candidate")
 
         best_sample = None
         best_value = float('inf')
-        top_samples = []
-        top_samples_values = []
+        top_sample = []
         used_indices = set()  # 用于记录已选择的候选点索引
         
-        num_candidates_per_iteration = max(int(num_candidate/iterations)+1, int(n_samples/10)+1)
+        num_candidates_per_iteration = int(num_candidate/4)
         
         for iteration in range(iterations):
             # samples = search_space[np.random.choice(search_space.shape[0], n_samples, replace=False)]
             samples = search_space
-            values = -model.predict(samples).reshape(-1)   # default optimization in sko is minimize, thus '-model'
+            values = -model.predict(np.atleast_2d(samples)).reshape(-1)   # default optimization in sko is minimize, thus '-model'
+            best_value = values[0]
         
             sorted_indices = np.argsort(values.reshape(-1))
             top_indices = sorted_indices[:num_candidates_per_iteration]
+            
             if candidate_list is not None:
                 current_top_samples, selected_idx = map_to_candidate_list(samples[top_indices], candidate_list, used_indices)
                 [used_indices.add(i) for i in selected_idx]
                 current_top_samples = np.array(current_top_samples)
-                current_top_values = -model.predict(current_top_samples).reshape(-1)
+                current_top_values = -model.predict(np.atleast_2d(current_top_samples)).reshape(-1)
             else:
                 current_top_samples = samples[top_indices]
                 current_top_values = values[top_indices]
-        
+
+            if best_sample is None:
+                best_sample = current_top_samples[np.argmin(current_top_values)]
             if min(current_top_values).item() < best_value:
                 best_sample = current_top_samples[np.argmin(current_top_values)]
-                best_value = current_top_values[np.argmin(current_top_values)].item()
-        
-            top_samples.extend(current_top_samples)
-            top_samples_values.extend(current_top_values)
-        
-            new_samples = []
-            for _ in range(n_samples):
-                step = self.levy_flight(Lambda) * perturbation_scale
-                new_sample = (best_sample+current_top_samples[np.random.randint(len(current_top_samples))])/2 + step * np.random.randn(feature_dim)
-                if isinstance(self.scaler, MinMaxScaler):
-                    new_sample = np.clip(new_sample, 0, 1)
-                elif isinstance(self.scaler, StandardScaler):
-                    new_sample = np.clip(new_sample, -12, 12)  # Assuming 3 standard deviations as bounds
-                new_samples.append(new_sample)
-        
-            new_samples = np.array(new_samples)
-            search_space = new_samples
-            # search_space = np.vstack((search_space, new_samples))
 
-        logging.info(f'best_value: {best_value}')
-        top_samples_arg = np.argsort(np.array(top_samples_values).reshape(-1))
-        return np.array(top_samples)[top_samples_arg][:num_candidate]
+            print(f"iter {iteration} top 10 values: {np.array(current_top_values)[np.argsort(current_top_values.reshape(-1))[:10]]}")
+
+            steps = self.levy_flight(1.5, size=(n_samples, feature_dim)) * perturbation_scale
+            indices = np.random.randint(len(current_top_samples), size=n_samples)
+            random_top_samples = current_top_samples[indices]
+            new_samples = (best_sample + random_top_samples) / 2 + steps * np.random.randn(n_samples, feature_dim)
+            new_samples = np.clip(new_samples, lb, ub)
+
+            search_space = np.vstack(([best_sample], search_space, new_samples))
+
+        # values = -model.predict(search_space).reshape(-1)
+        if candidate_list is not None:
+            final_top_samples = np.array(candidate_list[list(used_indices)])
+        else:
+            final_top_samples = search_space
+            
+        final_top_values = -model.predict(np.atleast_2d(final_top_samples)).reshape(-1)
+        final_samples_arg = np.argsort(np.array(final_top_values).reshape(-1))
+
+        if candidate_list is not None:
+            final_samples, selected_idx = map_to_candidate_list(np.array(final_top_samples)[final_samples_arg][:num_candidate], candidate_list, used_indices)
+            return final_samples, selected_idx
+        else:
+            return np.array(final_top_samples)[final_samples_arg][:num_candidate]
 
     def genetic_algorithm_sampling(self, model, feature_dim, population_size=1000, generations=20, num_candidate=10, candidate_list=None):
         # if population_size < num_candidate:
         #     raise ValueError("Total sampling points must be greater than num_candidate")
         num_candidate = min(population_size, num_candidate)
 
-        if isinstance(self.scaler, MinMaxScaler):
+        if self.feature_bounds is not None:
+            lb, ub = self.feature_bounds
+        elif isinstance(self.scaler, MinMaxScaler):
             lb, ub = [0] * feature_dim, [1] * feature_dim
         elif isinstance(self.scaler, StandardScaler):
             lb, ub = [-9] * feature_dim, [9] * feature_dim  # Assuming 3 standard deviations as bounds
         else:
-            raise ValueError("Unsupported scaler type")
+            lb, ub = None, None
 
         def fitness_func(individual):
-            return -model.predict(np.array(individual).reshape(1, -1)).item()
+            return -model.predict(np.atleast_2d(np.array(individual))).reshape(-1) #.reshape(1, -1).item()
             
         ga = GA(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=generations, lb=lb, ub=ub)
         best_x, best_y = ga.run()
-        logging.info(f'best_value: {best_y}')
+        print(f'sampling best_value: {best_y}')
 
         sorted_indices = np.argsort(ga.Y.reshape(-1))
         X_selected = ga.X[sorted_indices][:num_candidate*3]
@@ -222,7 +409,7 @@ class Sampler:
             [used_indices.add(i) for i in selected_idx] 
             current_top_samples = np.array(current_top_samples)
             
-            current_top_values = -model.predict(current_top_samples).reshape(-1)
+            current_top_values = -model.predict(np.atleast_2d(current_top_samples)).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
             X_selected = current_top_samples[candi_arg]
 
@@ -233,19 +420,23 @@ class Sampler:
         if population_size * iterations < num_candidate:
             raise ValueError("Total sampling points must be greater than num_candidate")
 
-        if isinstance(self.scaler, MinMaxScaler):
+        if self.feature_bounds is not None:
+            lb, ub = self.feature_bounds
+        elif isinstance(self.scaler, MinMaxScaler):
             lb, ub = [0] * feature_dim, [1] * feature_dim
         elif isinstance(self.scaler, StandardScaler):
             lb, ub = [-9] * feature_dim, [9] * feature_dim  # Assuming 3 standard deviations as bounds
         else:
-            raise ValueError("Unsupported scaler type")
+            lb, ub = None, None
+
+        logging.info(f'used sampler bounds: {lb, ub}')
 
         def fitness_func(x):
-            return -model.predict(np.array(x).reshape(1, -1)).item()
+            return -model.predict(np.atleast_2d(np.array(x))).reshape(-1)#.reshape(1, -1).item()
 
         pso = PSO(func=fitness_func, n_dim=feature_dim, pop=population_size, max_iter=iterations, lb=lb, ub=ub)
         best_x, best_y = pso.run()
-        logging.info(f'best_value: {best_y}')
+        print(f'sampling best_value: {best_y}')
 
         sorted_indices = np.argsort(pso.Y.reshape(-1))
         X_selected = pso.X[sorted_indices][:num_candidate*3]
@@ -256,7 +447,7 @@ class Sampler:
             current_top_samples, selected_idx = map_to_candidate_list(X_selected, candidate_list, used_indices)
             [used_indices.add(i) for i in selected_idx]   
             current_top_samples = np.array(current_top_samples)
-            current_top_values = -model.predict(current_top_samples).reshape(-1)
+            current_top_values = -model.predict(np.atleast_2d(current_top_samples)).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
             X_selected = current_top_samples[candi_arg]
 
@@ -268,48 +459,51 @@ class Sampler:
         # iterations = (num_candidate//(2*iterations)+1)*iterations if iterations<num_candidate//2 else iterations
         SA_iter_nums = int(num_candidate/70)+1
 
+        if self.feature_bounds is not None:
+            lb, ub = self.feature_bounds
+        elif isinstance(self.scaler, MinMaxScaler):
+            lb, ub = [0] * feature_dim, [1] * feature_dim
+        elif isinstance(self.scaler, StandardScaler):
+            lb, ub = [-9] * feature_dim, [9] * feature_dim  # Assuming 3 standard deviations as bounds
+        else:
+            lb, ub = None, None
+
+        logging.info(f'used sampler bounds: {lb, ub}')
+
         samples = []
         for SA_iter in range(SA_iter_nums):
-            # if candidate_list is None:
+            
             if isinstance(self.scaler, MinMaxScaler):
-                x0 = np.clip(np.random.rand(feature_dim),0,1)
-            elif isinstance(self.scaler, StandardScaler):
-                x0 = np.clip(np.random.randn(feature_dim),-9,9)
+                x0 = np.clip(np.random.rand(feature_dim),lb,ub)
             else:
-                raise ValueError("Unsupported scaler type")
-            # else:
-            #     x0 = np.mean(candidate_list, axis=0)
+                x0 = np.clip(np.random.randn(feature_dim),lb,ub)
     
             def fitness_func(x):
-                return -model.predict(np.array(x).reshape(1, -1)).item()
+                return -model.predict(np.atleast_2d(np.array(x))).reshape(-1)#.reshape(1, -1).item()
 
             def neighbor_func(x, temperature):
                 step = np.random.normal(0, 1, size=len(x)) * 0.1 * temperature
                 new_sample = x + step
-
-                if isinstance(self.scaler, MinMaxScaler):
-                    new_sample = np.clip(new_sample, 0, 1)
-                elif isinstance(self.scaler, StandardScaler):
-                    new_sample = np.clip(new_sample, -9, 9)                 
+                new_sample = np.clip(new_sample,lb,ub)           
             
                 return new_sample
 
             sa = SA(func=fitness_func, x0=x0, T_max=100, T_min=1e-9, L=iterations)
             sa.neighbor = neighbor_func  # Use custom neighbor function to ensure bounds
             best_x, best_y = sa.run()
-            logging.info(f'best_value: {best_y}')
+            print(f'sampling best_value: {best_y}')
             samples.append(np.array(sa.best_x_history))
 
         _X_sel = np.vstack(samples)
-        _Y_sel = -model.predict(_X_sel).reshape(-1)
-        print(f'select_sample_num: {len(_X_sel)}')
+        _Y_sel = -model.predict(np.atleast_2d(_X_sel)).reshape(-1)
+        # print(f'select_sample_num: {len(_X_sel)}')
 
         if candidate_list is not None:
             used_indices = set()
             current_top_samples, selected_idx = map_to_candidate_list(_X_sel, candidate_list, used_indices)
             [used_indices.add(i) for i in selected_idx]   
             current_top_samples = np.array(current_top_samples)
-            current_top_values = -model.predict(current_top_samples).reshape(-1)
+            current_top_values = -model.predict(np.atleast_2d(current_top_samples)).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
             X_selected = current_top_samples[candi_arg]
         else:
@@ -324,19 +518,23 @@ class Sampler:
         if n_ants * n_iterations < num_candidate:
             raise ValueError("Total sampling points must be greater than num_candidate")
 
-        if isinstance(self.scaler, MinMaxScaler):
-            lb, ub = [0] * feature_dim, [1] * feature_dim
-        elif isinstance(self.scaler, StandardScaler):
-            lb, ub = [-9] * feature_dim, [9] * feature_dim  # Assuming 3 standard deviations as bounds
-        else:
-            raise ValueError("Unsupported scaler type")
+        # if self.feature_bounds is not None:
+        #     lb, ub = self.feature_bounds
+        # elif isinstance(self.scaler, MinMaxScaler):
+        #     lb, ub = [0] * feature_dim, [1] * feature_dim
+        # elif isinstance(self.scaler, StandardScaler):
+        #     lb, ub = [-9] * feature_dim, [9] * feature_dim  # Assuming 3 standard deviations as bounds
+        # else:
+        #     lb, ub = None, None
+
+        # logging.info(f'used sampler bounds: {lb, ub}')
 
         def fitness_func(individual):
-            return -model.predict(np.array(individual).reshape(1, -1)).item()
+            return -model.predict(np.atleast_2d(np.array(individual))).reshape(-1)#.reshape(1, -1).item()
 
         aca = ACA_TSP(func=fitness_func, n_dim=feature_dim, size_pop=n_ants, max_iter=n_iterations, distance_matrix=np.random.rand(feature_dim, feature_dim))
         best_x, best_y = aca.run()
-        logging.info(f'best_value: {best_y}')
+        print(f'sampling best_value: {best_y}')
 
         sorted_indices = np.argsort(aca.Y.reshape(-1))
         X_selected = aca.X[sorted_indices][:num_candidate*3]
@@ -347,29 +545,33 @@ class Sampler:
             current_top_samples, selected_idx = map_to_candidate_list(X_selected, candidate_list, used_indices)
             [used_indices.add(i) for i in selected_idx]
             current_top_samples = np.array(current_top_samples)
-            current_top_values = -model.predict(current_top_samples).reshape(-1)
+            current_top_values = -model.predict(np.atleast_2d(current_top_samples)).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
             X_selected = current_top_samples[candi_arg]
 
         return np.array(X_selected[:num_candidate])
 
-    def differential_evolution_sampling(self, model, feature_dim, population_size=50, generations=20, num_candidate=10, candidate_list=None):
+    def differential_evolution_sampling(self, model, feature_dim, population_size=50, generations=300, num_candidate=10, candidate_list=None):
         if population_size * generations < num_candidate:
             raise ValueError("Total sampling points must be greater than num_candidate")
 
-        if isinstance(self.scaler, MinMaxScaler):
+        if self.feature_bounds is not None:
+            lb, ub = self.feature_bounds
+        elif isinstance(self.scaler, MinMaxScaler):
             lb, ub = [0] * feature_dim, [1] * feature_dim
         elif isinstance(self.scaler, StandardScaler):
             lb, ub = [-9] * feature_dim, [9] * feature_dim  # Assuming 3 standard deviations as bounds
         else:
-            raise ValueError("Unsupported scaler type")
+            lb, ub = None, None
+
+        logging.info(f'used sampler bounds: {lb, ub}')
 
         def fitness_func(x):
-            return -model.predict(np.array(x).reshape(1, -1)).item()
+            return -model.predict(np.atleast_2d(np.array(x))).reshape(-1)#.reshape(1, -1).item()
 
         de = DE(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=generations, lb=lb, ub=ub)
         best_x, best_y = de.run()
-        logging.info(f'best_value: {best_y}')
+        print(f'sampling best_value: {best_y}')
 
         sorted_indices = np.argsort(de.Y.reshape(-1))
         X_selected = de.X[sorted_indices][:num_candidate*3]
@@ -380,7 +582,7 @@ class Sampler:
             current_top_samples, selected_idx = map_to_candidate_list(X_selected, candidate_list, used_indices)
             [used_indices.add(i) for i in selected_idx]
             current_top_samples = np.array(current_top_samples)
-            current_top_values = -model.predict(current_top_samples).reshape(-1)
+            current_top_values = -model.predict(np.atleast_2d(current_top_samples)).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
             X_selected = current_top_samples[candi_arg]
 
@@ -391,19 +593,23 @@ class Sampler:
         if population_size * generations < num_candidate:
             raise ValueError("Total sampling points must be greater than num_candidate")
 
-        if isinstance(self.scaler, MinMaxScaler):
-            lb, ub = [0] * feature_dim, [1] * feature_dim
-        elif isinstance(self.scaler, StandardScaler):
-            lb, ub = [-9] * feature_dim, [9] * feature_dim  # Assuming 3 standard deviations as bounds
-        else:
-            raise ValueError("Unsupported scaler type")
+        # if self.feature_bounds is not None:
+        #     lb, ub = self.feature_bounds
+        # elif isinstance(self.scaler, MinMaxScaler):
+        #     lb, ub = [0] * feature_dim, [1] * feature_dim
+        # elif isinstance(self.scaler, StandardScaler):
+        #     lb, ub = [-9] * feature_dim, [9] * feature_dim  # Assuming 3 standard deviations as bounds
+        # else:
+        #     lb, ub = None, None
+
+        # logging.info(f'used sampler bounds: {lb, ub}')
 
         def fitness_func(individual):
-            return -model.predict(np.array(individual).reshape(1, -1)).item()
+            return -model.predict(np.atleast_2d(np.array(individual))).reshape(-1)#.reshape(1, -1).item()
 
         ia = IA_TSP(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=generations, prob_mut=0.2, T=0.7, alpha=0.95)
         best_x, best_y = ia.run()
-        logging.info(f'best_value: {best_y}')
+        print(f'sampling best_value: {best_y}')
 
         sorted_indices = np.argsort(ia.Y.reshape(-1))
         X_selected = ia.X[sorted_indices][:num_candidate*3]
@@ -414,7 +620,7 @@ class Sampler:
             current_top_samples, selected_idx = map_to_candidate_list(X_selected, candidate_list, used_indices)
             [used_indices.add(i) for i in selected_idx]   
             current_top_samples = np.array(current_top_samples)
-            current_top_values = -model.predict(current_top_samples).reshape(-1)
+            current_top_values = -model.predict(np.atleast_2d(current_top_samples)).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
             X_selected = current_top_samples[candi_arg]
 
@@ -425,19 +631,23 @@ class Sampler:
         if population_size * iterations < num_candidate:
             raise ValueError("Total sampling points must be greater than num_candidate")
 
-        if isinstance(self.scaler, MinMaxScaler):
-            lb, ub = [0] * feature_dim, [1] * feature_dim
-        elif isinstance(self.scaler, StandardScaler):
-            lb, ub = [-9] * feature_dim, [9] * feature_dim  # Assuming 3 standard deviations as bounds
-        else:
-            raise ValueError("Unsupported scaler type")
+        # if self.feature_bounds is not None:
+        #     lb, ub = self.feature_bounds
+        # elif isinstance(self.scaler, MinMaxScaler):
+        #     lb, ub = [0] * feature_dim, [1] * feature_dim
+        # elif isinstance(self.scaler, StandardScaler):
+        #     lb, ub = [-9] * feature_dim, [9] * feature_dim  # Assuming 3 standard deviations as bounds
+        # else:
+        #     lb, ub = None, None
+
+        # logging.info(f'used sampler bounds: {lb, ub}')
 
         def fitness_func(x):
-            return -model.predict(np.array(x).reshape(1, -1)).item()
+            return -model.predict(np.atleast_2d(np.array(x))).reshape(-1)#.reshape(1, -1).item()
 
         afsa = AFSA(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=iterations, max_try_num=100, step=0.5, visual=0.3, q=0.98, delta=0.5)
         best_x, best_y = afsa.run()
-        logging.info(f'best_value: {best_y}')
+        print(f'sampling best_value: {best_y}')
 
         sorted_indices = np.argsort(afsa.Y.reshape(-1))
         X_selected = afsa.X[sorted_indices][:num_candidate*3]
@@ -448,7 +658,7 @@ class Sampler:
             current_top_samples, selected_idx = map_to_candidate_list(X_selected, candidate_list, used_indices)
             [used_indices.add(i) for i in selected_idx] 
             current_top_samples = np.array(current_top_samples)
-            current_top_values = -model.predict(current_top_samples).reshape(-1)
+            current_top_values = -model.predict(np.atleast_2d(current_top_samples)).reshape(-1)
             candi_arg = np.argsort(current_top_values.reshape(-1))
             X_selected = current_top_samples[candi_arg]
 
@@ -460,7 +670,7 @@ class Sampler:
     ### highly suggest the developeer hack the skopt code, replacing mulltiprocess in sko with Ray Actor for parallelisation. (since the multiuprocess may conflict with ray in resources and process management)
 
     ### Serial candidate generation
-    def generate_candidates(self, method, model, feature_dim, num_candidate=100, n_samples=1000, iterations=50, candidate_list=None):
+    def generate_candidates(self, method, model, feature_dim, num_candidate=100, n_samples=100, iterations=500, candidate_list=None):
         ### method, model, feature_dim are the requested inputs
         if method == 'gaussian':
             return self.gaussian_sampling(feature_dim, num_candidate=num_candidate)
@@ -491,9 +701,6 @@ class Sampler:
             return self.immune_algorithm_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
         else:
             raise ValueError(f"Unknown sampling method: {method}")
-
-
-    ### the robustness of [gaussian, monte_carlo] has been tested; [GA, PSO, DE, AFS] are functional, but slow; SA can not control the boundary; [ACA, IA] are used for path optimisation
 
     ### ray function for parallel candidate generation
     @ray.remote
@@ -530,21 +737,29 @@ class Sampler:
             raise ValueError(f"Unknown sampling method: {method}")
 
     ### Parallel candidate generation
-    def generate_candidates_parallel(self, method, feature_dim, model_results, model_list, num_candidate=100, n_samples=1000, iterations=50, candidate_list=None):
+    def generate_candidates_parallel(self, method, feature_dim, model_results, model_list, num_target, model_path, num_candidate=100, n_samples=1000, iterations=50, candidate_list=None, n_random_models=4, Seperate=False):
 
         candidate_list_ref = ray.put(candidate_list)
         candidate_tasks = []
-        candidates = []
-        for target_i in model_results.keys():
-            for sg_model in model_list:
-                models = model_results[target_i][sg_model]['models']
-                model_errors = model_results[target_i][sg_model]['errors']
 
-                for model in models:
-                    candidate_tasks.append(self.generate_candidates_ray.remote(self, method=method, model=model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list_ref))
-
-        candidate_X_scaled = ray.get(candidate_tasks)
-        candidate_X_scaled = np.vstack(candidate_X_scaled)
+          #model_name, model_results, num_target, n_random_models=2, model_path
+        #model_list, model_results, num_target, n_random_models=2, model_path=f'{os.getcwd()}/model_weights'):
+        
+        # if Ray:
+        #     candidate_tasks.append(self.generate_candidates_ray.remote(self, method=method, model=random_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list_ref))
+        #     candidate_X_scaled = ray.get(candidate_tasks)
+        #     candidate_X_scaled = np.vstack(candidate_X_scaled)
+        if Seperate:
+            candidate_X_per_model=[]
+            for model in model_list:
+                logging.info(f'start {model}')
+                random_model = RandomizedAbstractSurrogateModel(model_list=[model], model_results=model_results, num_target=num_target, n_random_models=n_random_models, model_path=model_path) 
+                candidate_X_per_model.append(self.generate_candidates(method=method, model=random_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list))
+                logging.info(f'finish {model}')
+            candidate_X_scaled = np.vstack(candidate_X_per_model)
+        else:
+            random_model = RandomizedAbstractSurrogateModel(model_list=model_list, model_results=model_results, num_target=num_target, n_random_models=n_random_models, model_path=model_path) 
+            candidate_X_scaled = self.generate_candidates(method=method, model=random_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list)
         
         return candidate_X_scaled
 

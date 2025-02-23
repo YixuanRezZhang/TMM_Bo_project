@@ -21,15 +21,11 @@ class AbstractSurrogateModel(BaseEstimator, RegressorMixin):
         if self.model_name == 'GaussianProcess':
             Gmodel_res = model.model.posterior(torch.tensor(X, dtype=torch.float32))
             Gmean = Gmodel_res.mean.detach().cpu().numpy().reshape(-1)
-            # Gstd = torch.sqrt(Gmodel_res.variance).detach().cpu().numpy().reshape(-1)
             return Gmean
-        elif self.model_name == 'KAN':
-            return model.model(torch.tensor(X, dtype=torch.float32, device=device)).detach().cpu().numpy().flatten()
-        elif self.model_name == 'FastKAN':
+        elif self.model_name in ['KAN', 'FastKAN']:
             return model.model(torch.tensor(X, dtype=torch.float32, device=device)).detach().cpu().numpy().flatten()
         else:
-            preds = model.predict(X)
-            return preds
+            return model.predict(X)
 
     def fit(self, X, y):
         pass  # 已经拟合好，不需要再 fit
@@ -100,8 +96,6 @@ class ModelEvaluator:
             if model_name == 'GaussianProcess':
                 X_tr, X_te, y_tr, y_te = train_test_split(X_bs, y_bs, test_size=0.8)
                 model = SurrogateModel(model_name, optimized_params)
-                if cls:
-                    model = RegressionToClassificationWrapper(model)
                 model.fit(X_tr, y_tr)
                 preds = model.predict(X_te)
                 
@@ -134,8 +128,6 @@ class ModelEvaluator:
     def _train_model(self, model_name, optimized_params, X_bs, y_bs, bootstrap_indices, cls, use_full_eval):
 
         model = SurrogateModel(model_name, optimized_params)
-        if cls:
-            model = RegressionToClassificationWrapper(model)
         model.fit(X_bs[bootstrap_indices], y_bs[bootstrap_indices])
 
         if use_full_eval:

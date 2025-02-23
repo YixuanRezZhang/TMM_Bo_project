@@ -76,8 +76,8 @@ class AcquisitionFunction:
             global_pareto_indices.extend(batch_indices + i * batch_size)
         global_pareto_indices = list(set(global_pareto_indices))  # Deduplicate indices
         global_pareto_points = points[global_pareto_indices]
-        logging.info(f'global_pareto_indices: {global_pareto_indices}')
-        logging.info(f'global_pareto_points: {global_pareto_points}')
+        # logging.info(f'global_pareto_indices: {global_pareto_indices}')
+        # logging.info(f'global_pareto_points: {global_pareto_points}')
     
         # Step 2: Compute hypervolume contributions for global Pareto front
         logging.info('start hyper volume calculation')

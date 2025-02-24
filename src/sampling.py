@@ -18,6 +18,27 @@ from sklearn.neighbors import KDTree
 from scipy.spatial import distance
 import faiss
 
+@ray.remote
+def small_model_predict(X, model):
+    return model.predict(X)
+
+@ray.remote
+def model_predict(X, modelname, models, model_score, n_random_models):
+    # 重构后的独立函数，包含所有必要参数
+    if len(models) > n_random_models:
+        chosen_models = np.random.choice(models, size=n_random_models, replace=False)
+    else:
+        chosen_models = models
+    
+    # 同步调用普通远程函数
+    if modelname not in ['GaussianProcess', 'KAN', 'FastKAN']:
+        if len(chosen_models) > 1:
+            futures = [small_model_predict.remote(X, model) for model in chosen_models]
+            result = ray.get(futures)
+        else:
+            result = [model.predict(X) for model in chosen_models]
+    return np.mean(np.array(result), axis=0)*model_score
+
 class RandomizedAbstractSurrogateModel(BaseEstimator, RegressorMixin):
     def __init__(self, model_list, model_results, num_target, n_random_models=2, model_path=f'{os.getcwd()}/model_weights'):
         self.model_list = model_list
@@ -48,41 +69,7 @@ class RandomizedAbstractSurrogateModel(BaseEstimator, RegressorMixin):
             for count, modelname in enumerate(model_list):
                 self.models[target_i][f"{modelname}_score"] = model_score_lists[count]/sum(model_score_lists)
                 
-            logging.info(f'initialized RandomizedAbstractSurrogateModel')
-            
-            
-    @ray.remote
-    def small_model_predict(self, X, model):
-        return model.predict(X)
-    
-    @ray.remote
-    def model_predict(self, X, modelname, models, model_score):
-
-        if len(models) > self.n_random_models:
-            chosen_models = np.random.choice(models, size=self.n_random_models, replace=False)
-        else:
-            chosen_models = models
-        
-        if modelname == 'GaussianProcess':
-            result = []
-            for model in chosen_models:
-                Gmodel_res = model.model.posterior(torch.tensor(X, dtype=torch.float32))
-                Gmean = Gmodel_res.mean.detach().cpu().numpy().reshape(-1)
-                result.append(Gmean)
-            
-        elif modelname in ['KAN', 'FastKAN']:
-            result = []
-            for model in chosen_models:
-                res = model.model(torch.tensor(X, dtype=torch.float32, device=device)).detach().cpu().numpy().flatten()
-                result.append(res)
-            
-        else:
-            if len(chosen_models) <=1:
-                result = [model.predict(X) for model in chosen_models]
-            else:
-                result = ray.get([self.small_model_predict.remote(self, X, model) for model in chosen_models])
-
-        return np.mean(np.array(result), axis=0)*model_score
+            # logging.info(f'initialized RandomizedAbstractSurrogateModel')
 
     def fit(self, X, y):
         pass  # 已经拟合好，不需要再 fit
@@ -92,13 +79,12 @@ class RandomizedAbstractSurrogateModel(BaseEstimator, RegressorMixin):
         
         for k in self.models.keys():
     
-            pred = ray.get([self.model_predict.remote(self, X, modelname, self.models[k][modelname], self.models[k][f"{modelname}_score"]) for modelname in self.model_list])
+            pred = ray.get([model_predict.remote(X, modelname, self.models[k][modelname], self.models[k][f"{modelname}_score"], self.n_random_models) for modelname in self.model_list])
             pred = np.sum(np.array(pred), axis=0)
-            
             predictions.append(pred)
 
         result = np.sum(np.square(np.array(predictions)+3),axis=0)
-        logging.info(f'finish RandomizedAbstractSurrogateModel prediction')
+        # print(f'finish RandomizedAbstractSurrogateModel prediction')
         return result
 
 # slow version
@@ -565,6 +551,7 @@ class Sampler:
             lb, ub = None, None
 
         logging.info(f'used sampler bounds: {lb, ub}')
+        # print(f'used sampler bounds: {lb, ub}')
 
         def fitness_func(x):
             return -model.predict(np.atleast_2d(np.array(x))).reshape(-1)#.reshape(1, -1).item()
@@ -707,56 +694,54 @@ class Sampler:
     def generate_candidates_ray(self, method, model, feature_dim, num_candidate=100, n_samples=1000, iterations=50, candidate_list=None):
         ### method, model, feature_dim are the requested inputs
         if method == 'gaussian':
-            return self.gaussian_sampling(feature_dim, num_candidate=num_candidate)
+            sample_results = self.gaussian_sampling(feature_dim, num_candidate=num_candidate)
         elif method == 'bernoulli':
-            return self.bernoulli_sampling(feature_dim, num_candidate=num_candidate)
+            sample_results = self.bernoulli_sampling(feature_dim, num_candidate=num_candidate)
         elif method == 'monte_carlo':
-            return self.monte_carlo_sampling(model, feature_dim, n_samples=n_samples, iterations=iterations, perturbation_scale=0.1, Lambda=1.5, num_candidate=num_candidate, candidate_list=candidate_list)
+            sample_results = self.monte_carlo_sampling(model, feature_dim, n_samples=n_samples, iterations=iterations, perturbation_scale=0.1, Lambda=1.5, num_candidate=num_candidate, candidate_list=candidate_list)
         elif method == 'genetic_algorithm':
             # GA = importlib.import_module('sko.GA').GA
-            return self.genetic_algorithm_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+            sample_results = self.genetic_algorithm_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
         elif method == 'particle_swarm':
             # PSO = importlib.import_module('sko.PSO').PSO
-            return self.particle_swarm_sampling(model, feature_dim, population_size=n_samples, iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+            sample_results = self.particle_swarm_sampling(model, feature_dim, population_size=n_samples, iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
         elif method == 'differential_evolution':
             # DE = importlib.import_module('sko.DE').DE
-            return self.differential_evolution_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+            sample_results = self.differential_evolution_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
         elif method == 'artificial_fish_swarm':
             # AFSA = importlib.import_module('sko.AFSA').AFSA
-            return self.artificial_fish_swarm_sampling(model, feature_dim, population_size=n_samples, iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+            sample_results = self.artificial_fish_swarm_sampling(model, feature_dim, population_size=n_samples, iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
         elif method == 'simulated_annealing':
             # SA = importlib.import_module('sko.SA').SA
-            return self.simulated_annealing_sampling(model, feature_dim, iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+            sample_results = self.simulated_annealing_sampling(model, feature_dim, iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
         elif method == 'ant_colony':
             # ACA_TSP = importlib.import_module('sko.ACA').ACA_TSP
-            return self.ant_colony_sampling(model, feature_dim, n_ants=n_samples, n_best=5, n_iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+            sample_results = self.ant_colony_sampling(model, feature_dim, n_ants=n_samples, n_best=5, n_iterations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
         elif method == 'immune_algorithm':
             # IA_TSP = importlib.import_module('sko.IA').IA_TSP
-            return self.immune_algorithm_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
+            sample_results = self.immune_algorithm_sampling(model, feature_dim, population_size=n_samples, generations=iterations, num_candidate=num_candidate, candidate_list=candidate_list)
         else:
             raise ValueError(f"Unknown sampling method: {method}")
+        
+        print(f'finish {model.model_list}')
+        
+        return sample_results
 
     ### Parallel candidate generation
-    def generate_candidates_parallel(self, method, feature_dim, model_results, model_list, num_target, model_path, num_candidate=100, n_samples=1000, iterations=50, candidate_list=None, n_random_models=4, Seperate=False):
+    def generate_candidates_parallel(self, method, feature_dim, model_results, model_list, num_target, model_path, num_candidate=100, n_samples=1000, iterations=50, candidate_list=None, n_random_models=4, Seperate=True):
 
         candidate_list_ref = ray.put(candidate_list)
-        candidate_tasks = []
-
-          #model_name, model_results, num_target, n_random_models=2, model_path
-        #model_list, model_results, num_target, n_random_models=2, model_path=f'{os.getcwd()}/model_weights'):
         
-        # if Ray:
-        #     candidate_tasks.append(self.generate_candidates_ray.remote(self, method=method, model=random_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list_ref))
-        #     candidate_X_scaled = ray.get(candidate_tasks)
-        #     candidate_X_scaled = np.vstack(candidate_X_scaled)
         if Seperate:
             candidate_X_per_model=[]
-            for model in model_list:
-                logging.info(f'start {model}')
-                random_model = RandomizedAbstractSurrogateModel(model_list=[model], model_results=model_results, num_target=num_target, n_random_models=n_random_models, model_path=model_path) 
-                candidate_X_per_model.append(self.generate_candidates(method=method, model=random_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list))
-                logging.info(f'finish {model}')
-            candidate_X_scaled = np.vstack(candidate_X_per_model)
+            for ag_model in model_list:
+                logging.info(f'start {ag_model}')
+                random_model = RandomizedAbstractSurrogateModel(model_list=[ag_model], model_results=model_results, num_target=num_target, n_random_models=n_random_models, model_path=model_path) 
+                # candidate_X_per_model.append(self.generate_candidates(method=method, model=random_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list))
+                candidate_X_per_model.append(self.generate_candidates_ray.remote(self, method=method, model=random_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list))
+            # candidate_X_scaled = np.vstack(candidate_X_per_model)
+            ray_candidate_X_per_model = ray.get(candidate_X_per_model)
+            candidate_X_scaled = np.vstack(ray_candidate_X_per_model)
         else:
             random_model = RandomizedAbstractSurrogateModel(model_list=model_list, model_results=model_results, num_target=num_target, n_random_models=n_random_models, model_path=model_path) 
             candidate_X_scaled = self.generate_candidates(method=method, model=random_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list)

@@ -1,19 +1,41 @@
 name: Bo_project
 channels:
+  - rapidsai
   - conda-forge
+  - nvidia
+  - pytorch
 dependencies:
+  - python=3.12
+  - cuda-version=12.2
+  - rapids=25.06
   - numpy
   - pandas
+  - scipy
   - scikit-learn
-  - optuna
-  - xgboost
-  - lightgbm
-  - pytorch
-  - botorch
-  - gpytorch
-  - pygmo
   - matplotlib
+  - psutil
+  - pywavelets
+  - pygmo
+  - hdbscan
+  - faiss-cpu
+  - optuna
+  - lightgbm
   - pip
   - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.5.1+cu121
+      - torchvision==0.20.1+cu121
+      - torchaudio==2.5.1+cu121
+      - ray[data,train,tune,serve]
+      - botorch
+      - gpytorch
+      - xgboost
+      - catboost
       - scikit-opt
-      - ray
+      - pykan
+      - scikit-dimension
+      - sliced
+      - igraph
+      - leidenalg
+      - umap-learn
+      - git+https://github.com/ZiyaoLi/fast-kan.git

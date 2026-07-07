@@ -1,32 +1,41 @@
-from setuptools import setup, find_packages
+from setuptools import setup
+
 
 setup(
-    name='TMM_Bo_project',
-    version='0.1.0',
-    description='A modular framework for Bayesian optimization with various sampling and acquisition functions.',
-    author='Your Name',
-    author_email='your.email@example.com',
-    url='https://github.com/yourusername/bayesian_optimization',
-    packages=find_packages(where='src'),
-    package_dir={'': 'src'},
+    name="TMM_Bo_project",
+    version="0.1.0",
+    description="A modular framework for Bayesian optimization with adaptive sampling and acquisition functions.",
+    url="https://github.com/YixuanRezZhang/TMM_Bo_project",
+    packages=["src"],
+    py_modules=["main"],
     install_requires=[
-        'numpy',
-        'pandas',
-        'scikit-learn',
-        'optuna',
-        'xgboost',
-        'lightgbm',
-        'torch',
-        'botorch',
-        'gpytorch',
-        'pygmo',
-        'scikit-opt',
-        'ray',
-        'matplotlib'',
+        "numpy",
+        "pandas",
+        "scipy",
+        "scikit-learn",
+        "matplotlib",
+        "psutil",
+        "PyWavelets",
+        "optuna",
+        "xgboost",
+        "lightgbm",
+        "catboost",
+        "torch",
+        "botorch",
+        "gpytorch",
+        "pygmo",
+        "scikit-opt",
+        "ray[data,train,tune,serve]",
+        "pykan",
+        "scikit-dimension",
+        "sliced",
+        "igraph",
+        "leidenalg",
+        "umap-learn",
     ],
     entry_points={
-        'console_scripts': [
-            'TMM_Bo_project=main:main'
-        ]
+        "console_scripts": [
+            "tmm-bo=main:main",
+        ],
     },
 )

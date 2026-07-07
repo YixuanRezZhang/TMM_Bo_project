@@ -64,7 +64,6 @@ Compared with the older installation notes:
 
 - PyTorch has moved from CUDA 11.8 wheels to the tested CUDA 12.1 wheels: `torch==2.5.1+cu121`, `torchvision==0.20.1+cu121`, and `torchaudio==2.5.1+cu121`.
 - RAPIDS has moved from `rapids=25.04` with CUDA 11.4-11.8 constraints to the tested `rapids=25.06` with `cuda-version=12.2`.
-- The current source directly requires additional packages that were missing or implicit in the older list: `scipy`, `pywavelets`, `psutil`, `gpytorch`, `igraph`, `leidenalg`, and FAISS.
 - `faiss-cpu` is sufficient for the current nearest-neighbor and clustering code paths. GPU acceleration for clustering is handled through RAPIDS/cuML when CUDA is available.
 - `pykan` provides the `kan` module. `fast-kan` provides the `fastkan` module.
 - `multi_task.py` and `multi_fidelity.py` are included as active modules but are still being updated and tested.

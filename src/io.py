@@ -40,16 +40,19 @@ class IOManager:
         
         file_path = os.path.join(self.root, f'{file_name}')
         data = pd.read_csv(file_path)
+        
         if drop_columns is not None:
+            drop_columns = [col for col in drop_columns if col in data.columns]
             logging.info(f"drop columns: {drop_columns}")
             data = data.drop(columns=drop_columns)
 
-        # 检查指定的列是否存在
+        # Check whether the requested columns exist.
         missing_cols = [col for col in target_props if col not in data.columns]
         if missing_cols:
             raise ValueError(f"Missing columns: {missing_cols}")
 
-        target_props = list(set(target_props))  # Remove duplicates if any
+        target_props = sorted(list(set(target_props)))  # Remove duplicates if any
+        print('target_properties:', target_props)
 
         # Check for null values
         if data.isnull().values.any():
@@ -61,13 +64,13 @@ class IOManager:
         else:
             data, non_numeric_columns = self.handle_null_values(data, target_props, drop_non_numeric=drop_non_numeric)
 
-        # 如果没有指明feature_props, 使用除target外所有列
+        # If feature_props is not specified, use all columns except targets.
         if feature_props is None:
             feature_props = [col for col in data.columns if col not in target_props]
             feature_props = [col for col in feature_props if col not in non_numeric_columns]
         logging.info(f'used feature set: {feature_props}')
         
-        # 检查指定的feature列是否存在
+        # Check whether the requested feature columns exist.
         missing_feature_cols = [col for col in feature_props if col not in data.columns]
         if missing_feature_cols:
             raise ValueError(f"Missing feature columns: {missing_feature_cols}")
@@ -80,26 +83,31 @@ class IOManager:
 
         return X, y
 
-    def read_candidate_data(self, file_name, target_props, feature_props=None, descriptor_type='magpie', drop_non_numeric=True):
+    def read_candidate_data(self, file_name, target_props, feature_props=None, drop_columns=None, descriptor_type='magpie', drop_non_numeric=True):
         file_path = os.path.join(self.root, f'{file_name}')
         data = pd.read_csv(file_path)
+        
+        if drop_columns is not None:
+            drop_columns = [col for col in drop_columns if col in data.columns]
+            logging.info(f"drop columns: {drop_columns}")
+            data = data.drop(columns=drop_columns)
 
-        # 检查指定的列是否存在
+        # Check whether the requested columns exist.
         missing_cols = [col for col in target_props if col not in data.columns]
         if missing_cols:
-            raise ValueError(f"Missing columns: {missing_cols}")
+            print(f"No target column {missing_cols} in candidate_file")
 
-        target_props = list(set(target_props))  # Remove duplicates if any
+        target_props = sorted(list(set(target_props)))  # Remove duplicates if any
 
         data, non_numeric_columns = self.handle_null_values(data, target_props, drop_non_numeric=drop_non_numeric, if_train_data=False)
 
-        # 如果没有指明feature_props, 使用除target外所有列
+        # If feature_props is not specified, use all columns except targets.
         if feature_props is None:
             feature_props = [col for col in data.columns if col not in target_props]
             feature_props = [col for col in feature_props if col not in non_numeric_columns]
         logging.info(f'used feature set: {feature_props}')
         
-        # 检查指定的feature列是否存在
+        # Check whether the requested feature columns exist.
         missing_feature_cols = [col for col in feature_props if col not in data.columns]
         if missing_feature_cols:
             raise ValueError(f"Missing feature columns: {missing_feature_cols}")
@@ -109,33 +117,33 @@ class IOManager:
         return X
 
     def handle_null_values(self, data, target_props, drop_non_numeric, if_train_data=True):
-        # 处理target列的null值，通过删除包含null的行    
+        # Handle null target values by dropping rows that contain them.    
         if if_train_data:
             for target in target_props:
                 if data[target].isnull().any():
-                    data = data.dropna(subset=[target])   # 删除含有空值的行
+                    data = data.dropna(subset=[target])   # Drop rows with null values.
                     logging.info(f'drop samples contains null properties: {target}')
                 if drop_non_numeric and not pd.api.types.is_numeric_dtype(data[target]): 
-                    unique_values = data[target].nunique() # 计算唯一值数量
+                    unique_values = data[target].nunique() # Count the number of unique values.
                     if unique_values == 2:
-                        data[target] = data[target].astype('category').cat.codes # 将分类数据转换为 0/1 编码
+                        data[target] = data[target].astype('category').cat.codes # Convert categorical data to 0/1 codes.
                     else:
-                        # 如果不是二分类数据，抛出错误
+                        # Raise an error for non-binary categorical data.
                         raise ValueError(f"Target column {target} contains non-numeric data that cannot be converted to binary classification.")
         non_numeric_columns = []
-        # 处理非target列的null值，通过删除包含null的行
+        # Handle null values in non-target columns by dropping rows that contain them.
         for column in data.columns:
-            if column not in target_props: # 对于非目标列
+            if column not in target_props: # For non-target columns.
                 if drop_non_numeric and not pd.api.types.is_numeric_dtype(data[column]):
                     logging.info(f'drop feature which is non numeric: {column}')
-                    data = data.drop(columns=[column]) # 直接删除非数值列
-                    # 记录非数值列列名
+                    data = data.drop(columns=[column]) # Drop non-numeric columns directly.
+                    # Log non-numeric column names.
                     non_numeric_columns.append(column)  
-                elif data[column].isnull().any(): # 处理空值
+                elif data[column].isnull().any(): # Handle null values.
                     # logging.info(f'drop feature column contains null: {column}')
-                    # data = data.drop(columns=[column]) # 直接删除非数值列
+                    # data = data.drop(columns=[column]) # Drop non-numeric columns directly.
                     logging.info(f'drop samples contains null features: {column}')
-                    data = data.dropna(subset=[column]) # 删除含有空值的行
+                    data = data.dropna(subset=[column]) # Drop rows with null values.
         logging.info(f'length of cleaned data: {len(data)}')
 
         return data, non_numeric_columns
@@ -179,6 +187,11 @@ class IOManager:
                     y_scaled = self.scaler_y.transform(y)
             else:
                 raise ValueError("Invalid method. Use 'standard' or 'minmax'.")
+                
+            zero_var_X = self.scaler_X.scale_ == 0
+            self.scaler_X.scale_[zero_var_X] = 1.0
+            zero_var_y = self.scaler_y.scale_ == 0
+            self.scaler_y.scale_[zero_var_y] = 1.0
 
             if cand_X is not None:
                 cand_X_scaled = self.scaler_X.transform(cand_X)

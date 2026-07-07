@@ -15,7 +15,11 @@ fi
 
 # Activate the Conda environment
 # Use 'source' if running in a bash shell
-source "/home/phD/xiankang/anaconda3/etc/profile.d/conda.sh"
+if [ -n "${CONDA_SH:-}" ] && [ -f "$CONDA_SH" ]; then
+  source "$CONDA_SH"
+else
+  eval "$(conda shell.bash hook)"
+fi
 conda activate "$CONDA_ENV_NAME"
 
 # Run the Python script

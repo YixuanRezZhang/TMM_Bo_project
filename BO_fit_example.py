@@ -127,7 +127,7 @@ class Execute_module(PFExecuteModule):
             src_in_file = os.path.join(root_path, 'in.Quanty')
             shutil.move(src_in_file, root_path+'previous/'+folder+'/in.Quanty')
             os.chdir(root_path+'previous/'+folder)
-            os.popen('OMP_NUM_THREADS=8 nohup /home/phD/yixuan/softwares/Quanty/Quanty in.Quanty  >/dev/null 2>&1 &').read()  ### submit all simulation tasks
+            os.popen(f'OMP_NUM_THREADS=8 nohup {os.environ.get("QUANTY_EXECUTABLE", "Quanty")} in.Quanty >/dev/null 2>&1 &').read()  ### submit all simulation tasks
             os.chdir(root_path)
         ### --------------------------------------------------------------------------------- ###
             
@@ -155,7 +155,7 @@ class Execute_module(PFExecuteModule):
             while not os.path.isfile(root_path+'previous/'+folder+'/out.Quanty'):
                 print('no result calculated, retry')
                 os.chdir(root_path+'previous/'+folder)
-                os.popen('OMP_NUM_THREADS=8 nohup /home/phD/yixuan/softwares/Quanty/Quanty in.Quanty  >/dev/null 2>&1 &').read()
+                os.popen(f'OMP_NUM_THREADS=8 nohup {os.environ.get("QUANTY_EXECUTABLE", "Quanty")} in.Quanty >/dev/null 2>&1 &').read()
                 judge_num += 1
                 cal_len = int(os.popen("ps -aux | grep '[Q]uanty' | wc -l").read())
                 while cal_len!=0:

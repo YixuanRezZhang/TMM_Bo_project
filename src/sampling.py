@@ -1,5 +1,5 @@
 import multiprocessing
-import ray, os, logging
+import ray, os, logging, torch, pickle
 import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin
 import numpy as np
@@ -16,75 +16,177 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.neighbors import KDTree
 from scipy.spatial import distance
-import faiss
+try:
+    import faiss
+except ImportError:
+    faiss = None
+from torch.quasirandom import SobolEngine
+
+class mabo_DE(DE):
+
+    def __init__(self, func, n_dim, F=0.5,
+                 size_pop=50, max_iter=200, prob_mut=0.3,
+                 lb=-1, ub=1,
+                 constraint_eq=tuple(), constraint_ueq=tuple()):
+        # Call the parent constructor to complete base initialization.
+        super().__init__(func, n_dim, F, size_pop, max_iter, prob_mut,
+                         lb, ub, constraint_eq, constraint_ueq)
+        self.func = func
+        
+        self.lb = np.full(self.n_dim, lb) if np.ndim(lb) == 0 else np.array(lb, dtype=float)
+        self.ub = np.full(self.n_dim, ub) if np.ndim(ub) == 0 else np.array(ub, dtype=float)
+        self.X = np.random.uniform(low=self.lb, high=self.ub, size=(self.size_pop, self.n_dim))
+        
+        self.x2y()
+        self.all_history = []
+        self.all_history_U = []
+
+    def x2y(self):
+        if hasattr(self, '_cache_X') and np.array_equal(self._cache_X, self.X):
+            return self.Y
+
+        self.Y = self.evaluate(self.X)
+        self._cache_X = self.X.copy()
+        return self.Y
+
+    def evaluate(self, X):
+
+        Y_raw = self.func(X)
+        if not self.has_constraint:
+            return Y_raw
+        else:
+            penalty_eq = np.array([np.sum(np.abs([c_i(x) for c_i in self.constraint_eq])) for x in X])
+            penalty_ueq = np.array([np.sum(np.abs([max(0, c_i(x)) for c_i in self.constraint_ueq])) for x in X])
+            return Y_raw + 1e5 * penalty_eq + 1e5 * penalty_ueq
+
+    def selection(self):
+        """
+        greedy selection with caching of previous evaluations
+        """
+        f_X = self.Y.copy()
+        X_old = self.X.copy()
+        f_U = self.evaluate(self.U)
+        self.all_history_U.append((self.U.copy(), f_U.copy()))
+        
+        self.X = np.where((f_X < f_U).reshape(-1, 1), X_old, self.U)
+        self.Y = np.where((f_X < f_U), f_X, f_U)
+        self.all_history.append((self.X.copy(), self.Y.copy()))
+        
+        return self.X
+
+    def get_history(self):
+        X_cand = np.vstack([record[0] for record in self.all_history]) 
+        Y_cand = np.hstack([record[1] for record in self.all_history])
+        return X_cand, Y_cand
+        
+    def get_history_U(self):
+        X_cand = np.vstack([record[0] for record in self.all_history_U])
+        Y_cand = np.hstack([record[1] for record in self.all_history_U])
+        return X_cand, Y_cand
 
 @ray.remote
 def small_model_predict(X, model):
     return model.predict(X)
 
 @ray.remote
-def model_predict(X, modelname, models, model_score, n_random_models):
-    # 重构后的独立函数，包含所有必要参数
+def model_predict(X, modelname, models, model_score, n_random_models, select_region=None):
+    # Refactored standalone function containing all required parameters.
     if len(models) > n_random_models:
         chosen_models = np.random.choice(models, size=n_random_models, replace=False)
     else:
         chosen_models = models
     
-    # 同步调用普通远程函数
-    if modelname not in ['GaussianProcess', 'KAN', 'FastKAN']:
+    # Synchronize calls to the regular remote function.
+    if modelname not in ['GP_gpu', 'KAN', 'FastKAN']:
         if len(chosen_models) > 1:
             futures = [small_model_predict.remote(X, model) for model in chosen_models]
             result = ray.get(futures)
         else:
-            result = [model.predict(X) for model in chosen_models]
-    return np.mean(np.array(result), axis=0)*model_score
+            result = [model.predict(X) for model in chosen_models] # chosen_models[0].predict(X)
+    else:
+        result = []
+        if modelname == 'GP_gpu':
+            for model in chosen_models:
+                model_pred = model.model.posterior(torch.tensor(X, dtype=torch.float32))
+                result.append(model_pred.mean.detach().cpu().numpy().reshape(-1))
+        else:
+            for model in chosen_models:
+                result.append(model(torch.tensor(X, dtype=torch.float32, device=device)).detach().cpu().numpy().flatten())
+
+    pred_res = np.mean(np.array(result), axis=0)
+    if select_region is not None:
+        pred_res = -np.abs(pred_res-select_region)
+    return pred_res*model_score
 
 class RandomizedAbstractSurrogateModel(BaseEstimator, RegressorMixin):
-    def __init__(self, model_list, model_results, num_target, n_random_models=2, model_path=f'{os.getcwd()}/model_weights'):
+    def __init__(self, model_list, model_results, num_of_targets, n_random_models=2, model_path=f'{os.getcwd()}/model_weights', rand_all = False, select_region=None):
         self.model_list = model_list
         self.n_random_models = n_random_models
-        self.num_target = num_target
+        self.num_of_targets = num_of_targets
+        self.rand_all = rand_all
+        self.select_region = select_region
         
         self.models = {}
-        for target_i in range(self.num_target):
-            self.models[target_i] = {}
-            model_score_lists = []
-            for modelname in model_list:
-                if model_results is None:
-                    file_path = f"{model_path}/{modelname}_{target_i}_bootstrap.pkl"
-                    with open(file_path, 'rb') as f:
-                        data = pickle.load(f)
-                    target_models = data['models']
-                    target_model_errors = data['errors']
-                else:
-                    target_models = model_results[target_i][modelname]['models']
-                    target_model_errors = model_results[target_i][modelname]['errors']
+        if not self.rand_all:
+            for target_i in range(self.num_of_targets):
+                self.models[target_i] = {}
+                model_score_lists = []
+                for modelname in model_list:
+                    if model_results is None:
+                        file_path = f"{model_path}/{modelname}_{target_i}.pkl"
+                        with open(file_path, 'rb') as f:
+                            data = pickle.load(f)
+                        target_models = data['models']
+                        target_model_errors = data['errors']
+                    else:
+                        target_models = model_results[target_i][modelname]['models']
+                        target_model_errors = model_results[target_i][modelname]['errors']
+                        
+                    score_mu, score_std = np.mean(target_model_errors), np.std(target_model_errors)
+                    model_score = np.clip(score_mu + 0.1*score_std, 0.0000001, np.inf)
                     
-                score_mu, score_std = np.mean(target_model_errors), np.std(target_model_errors)
-                model_score = np.clip(score_mu-0.01*score_std, 0.0000001, np.inf)
-                
-                self.models[target_i][modelname] = target_models
-                model_score_lists.append(model_score)
-
-            for count, modelname in enumerate(model_list):
-                self.models[target_i][f"{modelname}_score"] = model_score_lists[count]/sum(model_score_lists)
-                
-            # logging.info(f'initialized RandomizedAbstractSurrogateModel')
+                    self.models[target_i][modelname] = target_models
+                    model_score_lists.append(model_score)
+    
+                for count, modelname in enumerate(model_list):
+                    self.models[target_i][f"{modelname}_score"] = model_score_lists[count]/sum(model_score_lists)
+        else:
+            for target_i in range(self.num_of_targets):
+                self.models[target_i] = {}
+                self.models[target_i]['all_models'] = []
+                for modelname in model_list:
+                    if model_results is None:
+                        file_path = f"{model_path}/{modelname}_{target_i}.pkl"
+                        with open(file_path, 'rb') as f:
+                            data = pickle.load(f)
+                        target_models = data['models']
+                    else:
+                        target_models = model_results[target_i][modelname]['models']
+                    
+                    self.models[target_i]['all_models'].extend(target_models)
+                    
+                self.models[target_i][f"all_models_score"] = 1
+                self.model_list = ['all_models']
 
     def fit(self, X, y):
-        pass  # 已经拟合好，不需要再 fit
+        pass  # Already fitted; no additional fit is needed.
 
     def predict(self, X):
         predictions = []
         
         for k in self.models.keys():
-    
-            pred = ray.get([model_predict.remote(X, modelname, self.models[k][modelname], self.models[k][f"{modelname}_score"], self.n_random_models) for modelname in self.model_list])
+
+            if self.select_region is not None:
+                logging.info(f'region selection: {self.select_region}')
+                select_reg = np.mean(self.select_region, axis=0)[k]
+            else:
+                select_reg = None
+     
+            pred = ray.get([model_predict.remote(X, modelname, self.models[k][modelname], self.models[k][f"{modelname}_score"], self.n_random_models, select_region=select_reg) for modelname in self.model_list])
             pred = np.sum(np.array(pred), axis=0)
             predictions.append(pred)
 
-        result = np.sum(np.square(np.array(predictions)+3),axis=0)
-        # print(f'finish RandomizedAbstractSurrogateModel prediction')
+        result = np.sqrt(np.sum(np.square(np.array(predictions)+3),axis=0))
         return result
 
 # slow version
@@ -93,13 +195,16 @@ def map_to_candidate_list_normal(samples, candidate_list, used_indices=None, met
     if used_indices is None:
         used_indices = set()
 
-    samples = [samples] if len(samples.shape) < 2 else samples
+    samples = np.atleast_2d(np.asarray(samples))
+    candidate_list = np.asarray(candidate_list)
+    if candidate_list.shape[0] == 0 or len(used_indices) >= len(candidate_list):
+        raise ValueError("No unused candidate points are available.")
 
     distances = distance.cdist(samples, candidate_list, metric=metric)
 
     # Set distances of already used points to infinity
     for idx in used_indices:
-        distances[idx] = np.inf
+        distances[:, idx] = np.inf
 
     nearest_indices = np.argmin(distances, axis=1)
     return candidate_list[nearest_indices], nearest_indices
@@ -110,13 +215,15 @@ def map_to_candidate_list_slow(samples, candidate_list, used_indices=None, metri
     if used_indices is None:
         used_indices = set()
 
-    tree = KDTree(candidate_list, metric=metric)
-
+    candidate_list = np.asarray(candidate_list)
     mask = np.ones(len(candidate_list), dtype=bool)
     mask[list(used_indices)] = False
 
     filtered_candidates = candidate_list[mask]
-    samples = [samples] if len(samples.shape) < 2 else samples
+    if filtered_candidates.shape[0] == 0:
+        raise ValueError("No unused candidate points are available.")
+    tree = KDTree(filtered_candidates, metric=metric)
+    samples = np.atleast_2d(np.asarray(samples))
 
     # Query nearest neighbors for all samples
     dists, nearest_indices_in_filtered = tree.query(samples, k=1)
@@ -136,17 +243,23 @@ def map_to_candidate_list(samples, candidate_list, used_indices=None, metric='eu
     if metric != 'euclidean':
         raise ValueError("Faiss currently only supports 'euclidean' distance.")
 
+    candidate_list = np.asarray(candidate_list)
     # Create a mask for unused points
     mask = np.ones(len(candidate_list), dtype=bool)
     mask[list(used_indices)] = False
     filtered_candidates = candidate_list[mask]
+    if filtered_candidates.shape[0] == 0:
+        raise ValueError("No unused candidate points are available.")
+
+    samples = np.atleast_2d(np.asarray(samples))
+    if faiss is None:
+        return map_to_candidate_list_slow(samples, candidate_list, used_indices=used_indices, metric=metric)
 
     # Build the Faiss index
     index = faiss.IndexFlatL2(filtered_candidates.shape[1])
     index.add(filtered_candidates.astype(np.float32))
 
     # Query nearest neighbors for all samples
-    samples = [samples] if len(samples.shape) < 2 else samples
     _, nearest_indices_in_filtered = index.search(samples.astype(np.float32), k=1)
     nearest_indices_in_filtered = nearest_indices_in_filtered.flatten()
 
@@ -164,6 +277,15 @@ class Sampler:
     def __init__(self, scaler, feature_bounds=None):
         self.scaler = scaler
         self.feature_bounds = feature_bounds
+
+    def sobol_sampling(self, feature_dim, num_candidate=50):
+        engine = SobolEngine(dimension=feature_dim, scramble=True)
+        sobol_points = engine.draw(num_candidate).numpy()
+        if isinstance(self.scaler, StandardScaler):
+            sobol_points = sobol_points * 6 - 3
+        if self.feature_bounds is not None:
+            sobol_points = np.clip(sobol_points, self.feature_bounds[0], self.feature_bounds[1]) 
+        return sobol_points
 
     def gaussian_sampling(self, feature_dim, mean=None, std_dev=None, num_candidate=10):
         
@@ -201,92 +323,6 @@ class Sampler:
         steps = u / np.power(np.abs(v), 1 / Lambda)
         return steps
 
-
-    # def monte_carlo_sampling(self, model, feature_dim, n_samples=100, iterations=20, perturbation_scale=0.3, Lambda=1.5, num_candidate=100, candidate_list=None):
-    #     """
-    #     Monte Carlo optimization sampling with iterative improvement and Levy flight.
-    #     """
-
-    #     if self.feature_bounds is not None:
-    #         lb, ub = self.feature_bounds
-    #     elif isinstance(self.scaler, MinMaxScaler):
-    #         lb, ub = [0] * feature_dim, [1] * feature_dim
-    #     elif isinstance(self.scaler, StandardScaler):
-    #         lb, ub = [-9] * feature_dim, [9] * feature_dim  # Assuming 3 standard deviations as bounds
-    #     else:
-    #         lb, ub = None, None
-
-    #     if isinstance(self.scaler, MinMaxScaler):
-    #         search_space = np.clip(np.random.rand(n_samples, feature_dim),lb,ub)
-    #     else:
-    #         search_space = np.clip(np.random.randn(n_samples, feature_dim),lb,ub)
-
-    #     if n_samples*iterations < num_candidate:
-    #         raise ValueError("Total sampling points must be greater than num_candidate")
-
-    #     best_sample = None
-    #     top_samples = []
-    #     top_samples_values = []
-    #     used_indices = set()  # 用于记录已选择的候选点索引
-        
-    #     num_candidates_per_iteration = max(int(num_candidate/iterations)+1, int(n_samples/10)+1)
-        
-    #     for iteration in range(iterations):
-    #         # samples = search_space[np.random.choice(search_space.shape[0], n_samples, replace=False)]
-    #         samples = search_space
-    #         values = -model.predict(samples).reshape(-1)   # default optimization in sko is minimize, thus '-model'
-
-    #         best_value = values[0]
-        
-    #         sorted_indices = np.argsort(values.reshape(-1))
-    #         top_indices = sorted_indices[:num_candidates_per_iteration]
-
-    #         # if candidate_list is not None:
-    #         #     current_top_samples, selected_idx = map_to_candidate_list(samples[top_indices], candidate_list, used_indices)
-    #         #     [used_indices.add(i) for i in selected_idx]
-    #         #     current_top_samples = np.array(current_top_samples)
-    #         #     current_top_values = -model.predict(current_top_samples).reshape(-1)
-    #         # else:
-    #         current_top_samples = samples[top_indices]
-    #         current_top_values = values[top_indices]
-
-    #         if best_sample is None:
-    #             best_sample = current_top_samples[np.argmin(current_top_values)]
-    #         if min(current_top_values).item() < best_value:
-    #             best_sample = current_top_samples[np.argmin(current_top_values)]
-
-    #         top_samples.extend(current_top_samples)
-    #         top_samples_values.extend(current_top_values)
-        
-    #         print(f"iter {iteration} top 10 values: {np.array(current_top_values)[np.argsort(current_top_values.reshape(-1))[:10]]}")
-            
-    #         # candi_samples = [[best_sample]]
-    #         # current_top_indices = [0]+list(np.random.choice(np.arange(1,num_candidates_per_iteration), size=4, replace=False))
-    #         # for i in current_top_indices:
-    #         steps = self.levy_flight(Lambda, size=(n_samples, feature_dim)) * perturbation_scale
-    #         indices = np.random.randint(len(current_top_samples), size=n_samples)
-    #         random_top_samples = current_top_samples[indices]
-    #         new_samples = (best_sample + random_top_samples) / 2 + steps * np.random.randn(n_samples, feature_dim)
-    #         new_samples = np.clip(new_samples, lb, ub)
-        
-    #         search_space = np.vstack(([best_sample], new_samples))
-
-    #     # values = -model.predict(search_space).reshape(-1)
-    #     # if candidate_list is not None:
-    #     #     # final_top_samples = np.array(candidate_list[list(used_indices)])
-    #     # else:
-    #     final_top_samples = top_samples
-            
-    #     final_top_values = -model.predict(final_top_samples).reshape(-1)
-    #     final_samples_arg = np.argsort(np.array(final_top_values).reshape(-1))
-    #     logging.info(f'best_value: {final_top_values[final_samples_arg[:10]]}')
-
-    #     if candidate_list is not None:
-    #         final_samples, selected_idx = map_to_candidate_list(np.array(final_top_samples)[final_samples_arg][:num_candidate], candidate_list, used_indices)
-    #         return final_samples, selected_idx
-    #     else:
-    #         return np.array(final_top_samples)[final_samples_arg][:num_candidate]
-
     def monte_carlo_sampling(self, model, feature_dim, n_samples=100, iterations=20, perturbation_scale=0.3, Lambda=1.5, num_candidate=100, candidate_list=None):
         """
         Monte Carlo optimization sampling with iterative improvement and Levy flight.
@@ -312,7 +348,7 @@ class Sampler:
         best_sample = None
         best_value = float('inf')
         top_sample = []
-        used_indices = set()  # 用于记录已选择的候选点索引
+        used_indices = set()  # Record indexes of already selected candidates.
         
         num_candidates_per_iteration = int(num_candidate/4)
         
@@ -339,7 +375,11 @@ class Sampler:
             if min(current_top_values).item() < best_value:
                 best_sample = current_top_samples[np.argmin(current_top_values)]
 
-            print(f"iter {iteration} top 10 values: {np.array(current_top_values)[np.argsort(current_top_values.reshape(-1))[:10]]}")
+            logging.debug(
+                "monte_carlo iter %s top 10 values: %s",
+                iteration,
+                np.array(current_top_values)[np.argsort(current_top_values.reshape(-1))[:10]],
+            )
 
             steps = self.levy_flight(1.5, size=(n_samples, feature_dim)) * perturbation_scale
             indices = np.random.randint(len(current_top_samples), size=n_samples)
@@ -383,11 +423,11 @@ class Sampler:
             
         ga = GA(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=generations, lb=lb, ub=ub)
         best_x, best_y = ga.run()
-        print(f'sampling best_value: {best_y}')
+        logging.info('%s sampling best_value: %s', model.model_list, best_y)
 
         sorted_indices = np.argsort(ga.Y.reshape(-1))
-        X_selected = ga.X[sorted_indices][:num_candidate*3]
-        Y_selected = ga.Y[sorted_indices][:num_candidate*3]
+        X_selected = ga.X[sorted_indices][:num_candidate]
+        Y_selected = ga.Y[sorted_indices][:num_candidate]
         
         if candidate_list is not None:
             used_indices = set()
@@ -422,11 +462,11 @@ class Sampler:
 
         pso = PSO(func=fitness_func, n_dim=feature_dim, pop=population_size, max_iter=iterations, lb=lb, ub=ub)
         best_x, best_y = pso.run()
-        print(f'sampling best_value: {best_y}')
+        logging.info('%s sampling best_value: %s', model.model_list, best_y)
 
         sorted_indices = np.argsort(pso.Y.reshape(-1))
-        X_selected = pso.X[sorted_indices][:num_candidate*3]
-        Y_selected = pso.Y[sorted_indices][:num_candidate*3]
+        X_selected = pso.X[sorted_indices][:num_candidate]
+        Y_selected = pso.Y[sorted_indices][:num_candidate]
         
         if candidate_list is not None:
             used_indices = set()
@@ -477,7 +517,7 @@ class Sampler:
             sa = SA(func=fitness_func, x0=x0, T_max=100, T_min=1e-9, L=iterations)
             sa.neighbor = neighbor_func  # Use custom neighbor function to ensure bounds
             best_x, best_y = sa.run()
-            print(f'sampling best_value: {best_y}')
+            logging.info('%s sampling best_value: %s', model.model_list, best_y)
             samples.append(np.array(sa.best_x_history))
 
         _X_sel = np.vstack(samples)
@@ -499,7 +539,7 @@ class Sampler:
         return np.array(X_selected[:num_candidate])
 
     # ant_colony_sampling is ont suitable when using for property optimization tasks 
-    #蚁群算法用于寻找问题的最优路径，它主要应用于路径优化和组合优化问题。对于当前版本采样代码只是将方程写出使其可以运行，但并未针对采样问题进行特殊配置，现阶段其并不适用于采样
+    # Ant colony optimization is mainly used for path and combinatorial optimization. This version only keeps a runnable formula and is not tuned for sampling yet.
     def ant_colony_sampling(self, model, feature_dim, n_ants=50, n_best=5, n_iterations=100, num_candidate=10, candidate_list=None):
         if n_ants * n_iterations < num_candidate:
             raise ValueError("Total sampling points must be greater than num_candidate")
@@ -520,11 +560,11 @@ class Sampler:
 
         aca = ACA_TSP(func=fitness_func, n_dim=feature_dim, size_pop=n_ants, max_iter=n_iterations, distance_matrix=np.random.rand(feature_dim, feature_dim))
         best_x, best_y = aca.run()
-        print(f'sampling best_value: {best_y}')
+        logging.info('%s sampling best_value: %s', model.model_list, best_y)
 
         sorted_indices = np.argsort(aca.Y.reshape(-1))
-        X_selected = aca.X[sorted_indices][:num_candidate*3]
-        Y_selected = aca.Y[sorted_indices][:num_candidate*3]
+        X_selected = aca.X[sorted_indices][:num_candidate]
+        Y_selected = aca.Y[sorted_indices][:num_candidate]
 
         if candidate_list is not None:
             used_indices = set()
@@ -556,13 +596,23 @@ class Sampler:
         def fitness_func(x):
             return -model.predict(np.atleast_2d(np.array(x))).reshape(-1)#.reshape(1, -1).item()
 
-        de = DE(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=generations, lb=lb, ub=ub)
-        best_x, best_y = de.run()
-        print(f'sampling best_value: {best_y}')
+        if num_candidate/population_size < 20:
+            de = DE(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=generations, lb=lb, ub=ub)
+            de.func = fitness_func
+            best_x, best_y = de.run()
+            
+            sorted_indices = np.argsort(de.Y.reshape(-1))
+            X_selected = de.X[sorted_indices][:num_candidate]
+            Y_selected = de.Y[sorted_indices][:num_candidate]
+        else:
+            de = mabo_DE(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=generations, lb=lb, ub=ub)
+            de.func = fitness_func
+            best_x, best_y = de.run()
 
-        sorted_indices = np.argsort(de.Y.reshape(-1))
-        X_selected = de.X[sorted_indices][:num_candidate*3]
-        Y_selected = de.Y[sorted_indices][:num_candidate*3]
+            X_de_cand, Y_de_cand = de.get_history_U()
+            sorted_indices = np.argsort(Y_de_cand.reshape(-1))
+            X_selected = X_de_cand[sorted_indices][:num_candidate]
+            Y_selected = Y_de_cand[sorted_indices][:num_candidate]
 
         if candidate_list is not None:
             used_indices = set()
@@ -573,9 +623,17 @@ class Sampler:
             candi_arg = np.argsort(current_top_values.reshape(-1))
             X_selected = current_top_samples[candi_arg]
 
+        logging.info(
+            '%s sampling best_value: %s and num of candidate: %s',
+            model.model_list,
+            best_y,
+            len(Y_selected),
+        )
+        assert np.all(X_selected >= lb) and np.all(X_selected <= ub), f'DE Out-of-bounds detected'
+
         return np.array(X_selected[:num_candidate])
 
-    #免疫优化算法同样用于寻找问题的最优路径，它主要应用于路径优化和组合优化问题。
+    # Immune optimization is also mainly used for path and combinatorial optimization.
     def immune_algorithm_sampling(self, model, feature_dim, population_size=50, generations=20, num_candidate=10, candidate_list=None):
         if population_size * generations < num_candidate:
             raise ValueError("Total sampling points must be greater than num_candidate")
@@ -596,11 +654,11 @@ class Sampler:
 
         ia = IA_TSP(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=generations, prob_mut=0.2, T=0.7, alpha=0.95)
         best_x, best_y = ia.run()
-        print(f'sampling best_value: {best_y}')
+        logging.info('%s sampling best_value: %s', model.model_list, best_y)
 
         sorted_indices = np.argsort(ia.Y.reshape(-1))
-        X_selected = ia.X[sorted_indices][:num_candidate*3]
-        Y_selected = ia.Y[sorted_indices][:num_candidate*3]
+        X_selected = ia.X[sorted_indices][:num_candidate]
+        Y_selected = ia.Y[sorted_indices][:num_candidate]
 
         if candidate_list is not None:
             used_indices = set()
@@ -613,7 +671,7 @@ class Sampler:
 
         return np.array(X_selected[:num_candidate])
 
-    # 人工鱼群算法,其表现需要进一步测试
+    # Artificial fish swarm optimization; its behavior needs further testing.
     def artificial_fish_swarm_sampling(self, model, feature_dim, population_size=50, iterations=20, num_candidate=10, candidate_list=None):
         if population_size * iterations < num_candidate:
             raise ValueError("Total sampling points must be greater than num_candidate")
@@ -634,11 +692,11 @@ class Sampler:
 
         afsa = AFSA(func=fitness_func, n_dim=feature_dim, size_pop=population_size, max_iter=iterations, max_try_num=100, step=0.5, visual=0.3, q=0.98, delta=0.5)
         best_x, best_y = afsa.run()
-        print(f'sampling best_value: {best_y}')
+        logging.info('%s sampling best_value: %s', model.model_list, best_y)
 
         sorted_indices = np.argsort(afsa.Y.reshape(-1))
-        X_selected = afsa.X[sorted_indices][:num_candidate*3]
-        Y_selected = afsa.Y[sorted_indices][:num_candidate*3]
+        X_selected = afsa.X[sorted_indices][:num_candidate]
+        Y_selected = afsa.Y[sorted_indices][:num_candidate]
 
         if candidate_list is not None:
             used_indices = set()
@@ -723,12 +781,12 @@ class Sampler:
         else:
             raise ValueError(f"Unknown sampling method: {method}")
         
-        print(f'finish {model.model_list}')
+        #print(f'finish {model.model_list}')
         
         return sample_results
 
     ### Parallel candidate generation
-    def generate_candidates_parallel(self, method, feature_dim, model_results, model_list, num_target, model_path, num_candidate=100, n_samples=1000, iterations=50, candidate_list=None, n_random_models=4, Seperate=True):
+    def generate_candidates_parallel(self, method, feature_dim, model_results, model_list, num_of_targets, model_path, num_candidate=100, n_samples=1000, iterations=50, candidate_list=None, n_random_models=2, Seperate=True, rand_all=True, select_region=None):
 
         candidate_list_ref = ray.put(candidate_list)
         
@@ -736,15 +794,22 @@ class Sampler:
             candidate_X_per_model=[]
             for ag_model in model_list:
                 logging.info(f'start {ag_model}')
-                random_model = RandomizedAbstractSurrogateModel(model_list=[ag_model], model_results=model_results, num_target=num_target, n_random_models=n_random_models, model_path=model_path) 
+                random_model = RandomizedAbstractSurrogateModel(model_list=[ag_model], model_results=model_results, num_of_targets=num_of_targets, n_random_models=n_random_models, model_path=model_path, select_region=select_region) 
                 # candidate_X_per_model.append(self.generate_candidates(method=method, model=random_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list))
+                candidate_X_per_model.append(self.generate_candidates_ray.remote(self, method=method, model=random_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list))
+            if rand_all:
+                random_model = RandomizedAbstractSurrogateModel(model_list=model_list, model_results=model_results, num_of_targets=num_of_targets, n_random_models=n_random_models+2, model_path=model_path, rand_all=rand_all, select_region=select_region)
                 candidate_X_per_model.append(self.generate_candidates_ray.remote(self, method=method, model=random_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list))
             # candidate_X_scaled = np.vstack(candidate_X_per_model)
             ray_candidate_X_per_model = ray.get(candidate_X_per_model)
             candidate_X_scaled = np.vstack(ray_candidate_X_per_model)
         else:
-            random_model = RandomizedAbstractSurrogateModel(model_list=model_list, model_results=model_results, num_target=num_target, n_random_models=n_random_models, model_path=model_path) 
+            random_model = RandomizedAbstractSurrogateModel(model_list=model_list, model_results=model_results, num_of_targets=num_of_targets, n_random_models=n_random_models, model_path=model_path, select_region=select_region)
             candidate_X_scaled = self.generate_candidates(method=method, model=random_model, feature_dim=feature_dim, num_candidate=num_candidate, n_samples=n_samples, iterations=iterations, candidate_list=candidate_list)
+
+        sobol_points = self.sobol_sampling(feature_dim, num_candidate=int(num_candidate*len(model_list)/5))
+        # sobol_points = self.sobol_sampling(feature_dim, num_candidate=num_candidate)
+        candidate_X_scaled = np.vstack([candidate_X_scaled, sobol_points])
+        logging.info('candidate_X_scaled num: %s', len(candidate_X_scaled))
         
         return candidate_X_scaled
-

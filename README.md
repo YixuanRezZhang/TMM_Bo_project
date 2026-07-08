@@ -85,3 +85,9 @@ Documentation entry points:
 - English: [docs/code_reference_en.md](docs/code_reference_en.md)
 - 中文: [docs/code_reference_zh.md](docs/code_reference_zh.md)
 - CLI and equation notes: [docs/usage.md](docs/usage.md)
+
+## License
+
+Copyright 2026 Yixuan Zhang and contributors.
+
+This project is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).

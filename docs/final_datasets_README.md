@@ -72,4 +72,4 @@ The source literature and data resources used to assemble the benchmark suite ar
 
 ## License and reuse note
 
-This archive aggregates and featurizes datasets from multiple literature and database sources. Before public release, the depositor should verify that redistribution of each processed CSV is consistent with the source dataset licenses and terms. The current Zenodo metadata is intentionally prepared as restricted/draft-oriented because source licenses are mixed or not fully verified. Do not publish the full archive under a single CC BY 4.0 license unless all upstream terms are confirmed compatible. See [dataset_source_license_review.md](dataset_source_license_review.md).
+This archive aggregates and featurizes datasets from multiple literature and database sources. The current Zenodo metadata is intentionally prepared for a restricted draft, not for immediate public publication. Before any public release, the depositor should verify that redistribution of each processed CSV is consistent with the corresponding source dataset licenses and terms.

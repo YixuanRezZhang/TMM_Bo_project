@@ -1,0 +1,11 @@
+# Local caches
+__pycache__/
+.ipynb_checkpoints/
+*.py[cod]
+
+# Large local data and manuscript PDFs used for Zenodo preparation
+Final_datasets/
+papers/
+
+# Zenodo upload outputs
+zenodo_deposition_response.json

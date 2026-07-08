@@ -2,7 +2,7 @@
   "metadata": {
     "title": "Final materials closed-pool benchmark datasets for Bayesian optimization",
     "upload_type": "dataset",
-    "description": "<p>This dataset archive contains the final CSV candidate pools used for closed-pool materials optimization benchmarks in the associated Bayesian optimization study and GitHub repository. The archive spans small experimental datasets, medium-size simulation datasets, and large high-dimensional molecular/materials pools. It includes single-objective and multi-objective tasks covering hardness, Curie temperature, additive-manufacturing density, steel mechanical properties, melting point, inorganic band gap, superconducting critical temperature and auxiliary properties, dielectric refractive index, 2D-material band gap, Materials Project-derived formation energy/magnetization/band-gap targets, thermoelectric power factor, QM9 molecular properties, Alexandria/ICAMS targets, and OMol HOMO-LUMO gap targets.</p><p>The files are prepared as tabular CSV candidate pools. Each row is one candidate material, molecule, alloy, or process condition. Target columns are named with the <code>target_</code> prefix where possible. The accompanying README included in the archive describes file-level sample counts, target columns, and source literature.</p>",
+    "description": "<p>This dataset archive contains the final CSV candidate pools used for closed-pool materials optimization benchmarks in the associated Bayesian optimization study and GitHub repository. The archive spans small experimental datasets, medium-size simulation datasets, and large high-dimensional molecular/materials pools. It includes single-objective and multi-objective tasks covering hardness, Curie temperature, additive-manufacturing density, steel mechanical properties, melting point, inorganic band gap, superconducting critical temperature and auxiliary properties, dielectric refractive index, 2D-material band gap, Materials Project-derived formation energy/magnetization/band-gap targets, thermoelectric power factor, QM9 molecular properties, Alexandria/ICAMS targets, and OMol HOMO-LUMO gap targets.</p><p>The files are prepared as tabular CSV candidate pools. Feature columns include Magpie-style composition descriptors, structure-derived descriptors, SOAP descriptors, molecular fingerprints from SMILES, process descriptors, and universal-MLIP latent features depending on the source dataset. Target columns are named with the <code>target_</code> prefix where possible. The accompanying README included in the archive describes file-level sample counts, target columns, descriptor representation, and source literature.</p><p>This draft is marked restricted while source-license compatibility is being checked. The full archive should not be published under a single open license until upstream redistribution rights are confirmed for every file.</p>",
     "creators": [
       {
         "name": "Zhang, Yixuan"
@@ -26,8 +26,7 @@
         "name": "Zhang, Hongbin"
       }
     ],
-    "access_right": "open",
-    "license": "cc-by-4.0",
+    "access_right": "restricted",
     "version": "1.0.0",
     "keywords": [
       "Bayesian optimization",
@@ -59,8 +58,9 @@
       "Schmidt, J. et al. Improving machine-learning models in materials science through large datasets. Materials Today Physics 48, 101560 (2024).",
       "Levine, D. S. et al. The Open Molecules 2025 (OMol25) dataset, evaluations, and models. arXiv:2505.08762 (2025)."
     ],
-    "notes": "The multi-task and multi-fidelity modules in the associated code repository are active modules but are still being updated and tested.",
+    "notes": "Preliminary source-license review indicates mixed or unverified upstream terms across files. In particular, QM9 is reported under CC BY-NC-SA 4.0 on the Scientific Data page, so the full archive should not be relicensed as CC BY 4.0 without further review. The multi-task and multi-fidelity modules in the associated code repository are active modules but are still being updated and tested.",
     "prereserve_doi": true,
-    "language": "eng"
+    "language": "eng",
+    "access_conditions": "Access is restricted while upstream dataset licenses and redistribution terms are being verified. Please contact the depositor for review access."
   }
 }

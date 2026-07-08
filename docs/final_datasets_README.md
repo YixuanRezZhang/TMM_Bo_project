@@ -4,13 +4,22 @@ This archive contains the final CSV datasets used for the closed-pool materials 
 
 https://github.com/YixuanRezZhang/TMM_Bo_project
 
-The files are prepared as tabular candidate pools for benchmarking Bayesian optimization and active sampling methods. Each row is one candidate material, molecule, alloy, or process condition. Feature columns contain composition-derived descriptors, structure-derived descriptors, molecular fingerprints, GNN descriptors, or process descriptors depending on the dataset. Target columns are prefixed with `target_` where possible and define the objective values used by the benchmark scripts.
+The files are prepared as tabular candidate pools for benchmarking Bayesian optimization and active sampling methods. Each row is one candidate material, molecule, alloy, or process condition. Feature columns contain composition-derived descriptors, structure-derived descriptors, molecular fingerprints, SOAP descriptors, universal-MLIP latent features, or process descriptors depending on the dataset. Target columns are prefixed with `target_` where possible and define the objective values used by the benchmark scripts.
 
 ## Dataset construction summary
 
 The benchmark suite was assembled to span small experimental datasets, medium-size simulation datasets, and large high-dimensional molecular/materials pools. The accompanying manuscript reports 15 closed-pool datasets with sizes from 635 to 3,986,754 samples and feature dimensionalities from 10 to 8,863. Dataset complexity was characterized using sample count, raw feature dimensionality, intrinsic dimensionality estimated from PCA variance coverage, effective resolution, objective conflict, graph distances, neighborhood sparsity, feature-target mutual information proxies, autocorrelation, correlation length, multimodality, channel capacity, basin contrast, and deceptive-peak metrics.
 
 The datasets include single-objective and multi-objective tasks. Examples include experimental hardness, Curie temperature, additive-manufacturing relative density, steel mechanical properties, melting point, inorganic band gap, superconducting critical temperature with auxiliary targets, dielectric refractive index, 2D-material band gap, Materials Project formation energy/magnetization/band-gap targets, thermoelectric power factor, QM9 molecular properties, Alexandria/ICAMS formation-energy/magnetization/band-gap targets, and OMol HOMO-LUMO gap targets.
+
+## Feature and descriptor generation
+
+- Materials datasets with composition fields were converted mainly with Magpie-style composition descriptors.
+- Materials datasets with crystal structures or structure-derived fields additionally contain local-environment and geometry descriptors. `3DSC_TC.csv` includes SOAP descriptors; `3DSC_TC_nosoap.csv` keeps the corresponding non-SOAP feature set.
+- Molecular datasets with SMILES, such as QM9 and melting points, use fixed-length molecular fingerprint descriptors.
+- OMol is represented by 128-dimensional latent outputs extracted from a universal machine-learning interatomic potential (universal MLIP), rather than by direct Magpie, SOAP, or SMILES fingerprints.
+- Some files combine raw collected quantities with generated descriptors; see the column names and target prefixes in each CSV.
+
 
 ## Files
 
@@ -63,4 +72,4 @@ The source literature and data resources used to assemble the benchmark suite ar
 
 ## License and reuse note
 
-This archive aggregates and featurizes datasets from multiple literature and database sources. Before public release, the depositor should verify that redistribution of each processed CSV is consistent with the source dataset licenses and terms. The Zenodo draft metadata is prepared with `cc-by-4.0`; adjust the license before publishing if a different license is required by any source dataset.
+This archive aggregates and featurizes datasets from multiple literature and database sources. Before public release, the depositor should verify that redistribution of each processed CSV is consistent with the source dataset licenses and terms. The current Zenodo metadata is intentionally prepared as restricted/draft-oriented because source licenses are mixed or not fully verified. Do not publish the full archive under a single CC BY 4.0 license unless all upstream terms are confirmed compatible. See [dataset_source_license_review.md](dataset_source_license_review.md).

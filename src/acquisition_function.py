@@ -15,6 +15,12 @@ from scipy.stats import norm
 import pygmo as pg
 import logging
 from src.evaluation import ClusterBootstrapSampler
+from src.model_uncertainty import (
+    aggregate_bootstrap_model_variance,
+    calibrate_oob_noise_variance,
+    kalman_fusion_weights,
+    predict_mean_and_internal_variance,
+)
 from scipy.signal import savgol_filter
 
 try:
@@ -48,13 +54,12 @@ def model_predict(model, X_candidate_ref, sg_model, start, end):
     # Fetch data from the object reference and slice the requested batch.
     X_candidate_batch = X_candidate_ref[start:end]
 
-    if sg_model == 'GP_gpu':
-        # Convert the NumPy batch to a tensor before evaluating the GP posterior.
-        Gmodel_res = model.model.posterior(torch.tensor(X_candidate_batch, dtype=torch.float32))
-        return Gmodel_res.mean.detach().cpu().numpy().reshape(-1), torch.sqrt(Gmodel_res.variance).detach().cpu().numpy().reshape(-1)
-    else:
-        preds = model.predict(X_candidate_batch)
-        return preds, None
+    mean, internal_variance = predict_mean_and_internal_variance(
+        model, X_candidate_batch, model_name=sg_model
+    )
+    if internal_variance is None:
+        internal_variance = np.zeros_like(mean, dtype=float)
+    return mean, internal_variance
 
 @ray.remote
 def compute_pareto_front_batch(points_ref, start, end):
@@ -474,7 +479,7 @@ def _read_sigma_data2(pack: dict) -> float | None:
             w = np.where(_ns > 0, _ns, 0.0)
             if w.sum() > 0:
                 val = float(np.sum(_vars * w) / np.sum(w))
-    if val is None or not np.isfinite(val) or val <= 0:
+    if val is None or not np.isfinite(val) or val < 0:
         return None
     return float(val)
 
@@ -564,6 +569,123 @@ def estimate_density_and_spread(
 
     return metrics
 
+def select_history_aware_diverse_batch(
+    X_candidates: np.ndarray,
+    base_scores: np.ndarray,
+    batch_size: int,
+    X_history: Optional[np.ndarray] = None,
+    novelty_floor: float = 0.05,
+    query_batch_size: int = 4096,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Greedily rank candidates against history and the current batch.
+
+    At step t the score is
+
+        base_i * [floor + (1-floor) * normalized_distance_i],
+
+    where distance_i is the nearest standardized Euclidean distance to either
+    a historically sampled point or a candidate already selected in this batch.
+    """
+    X_candidates = np.asarray(X_candidates, dtype=float)
+    base_scores = np.asarray(base_scores, dtype=float).reshape(-1)
+    if X_candidates.ndim != 2:
+        raise ValueError("X_candidates must be a 2-D array.")
+    if len(X_candidates) != len(base_scores):
+        raise ValueError("base_scores must match the candidate count.")
+    if not 0.0 <= novelty_floor <= 1.0:
+        raise ValueError("novelty_floor must be between 0 and 1.")
+    if batch_size <= 0 or len(X_candidates) == 0:
+        return np.empty(0, dtype=int), np.empty(len(X_candidates), dtype=float)
+
+    if X_history is None:
+        X_history = np.empty((0, X_candidates.shape[1]), dtype=float)
+    else:
+        X_history = np.asarray(X_history, dtype=float)
+        if X_history.ndim != 2:
+            raise ValueError("X_history must be a 2-D array.")
+        if X_history.shape[1] != X_candidates.shape[1]:
+            raise ValueError(
+                "X_history and X_candidates must have the same feature count."
+            )
+
+    all_points = np.vstack([X_candidates, X_history])
+    for feature_idx in range(all_points.shape[1]):
+        column = all_points[:, feature_idx]
+        finite = np.isfinite(column)
+        fill_value = float(np.median(column[finite])) if finite.any() else 0.0
+        column[~finite] = fill_value
+        all_points[:, feature_idx] = column
+
+    center = np.median(all_points, axis=0)
+    scale = np.std(all_points, axis=0)
+    scale = np.where(np.isfinite(scale) & (scale > 1e-12), scale, 1.0)
+    all_points = (all_points - center) / scale
+    candidate_points = all_points[:len(X_candidates)]
+    history_points = all_points[len(X_candidates):]
+
+    if len(history_points):
+        history_nn = NearestNeighbors(n_neighbors=1).fit(history_points)
+        history_distances = np.empty(len(candidate_points), dtype=float)
+        for start in range(0, len(candidate_points), query_batch_size):
+            end = min(start + query_batch_size, len(candidate_points))
+            history_distances[start:end] = history_nn.kneighbors(
+                candidate_points[start:end],
+                return_distance=True,
+            )[0][:, 0]
+    else:
+        history_distances = np.full(len(candidate_points), np.inf, dtype=float)
+
+    base_scores = np.nan_to_num(
+        base_scores, nan=0.0, posinf=0.0, neginf=0.0
+    )
+    base_scores = base_scores - min(float(np.min(base_scores)), 0.0)
+    max_base_score = float(np.max(base_scores))
+    if max_base_score > 0.0:
+        base_scores = base_scores / max_base_score
+    else:
+        base_scores = np.ones_like(base_scores)
+
+    selected = []
+    remaining = np.ones(len(candidate_points), dtype=bool)
+    nearest_occupied_distance = history_distances.copy()
+    initial_history_distances = history_distances.copy()
+
+    for _ in range(min(int(batch_size), len(candidate_points))):
+        remaining_idx = np.flatnonzero(remaining)
+        distances = nearest_occupied_distance[remaining_idx]
+        finite_distances = distances[np.isfinite(distances)]
+        positive_distances = finite_distances[finite_distances > 0.0]
+        if positive_distances.size:
+            distance_scale = float(np.percentile(positive_distances, 90))
+            normalized_distance = np.clip(
+                distances / max(distance_scale, 1e-12),
+                0.0,
+                1.0,
+            )
+        elif finite_distances.size:
+            normalized_distance = np.zeros_like(distances)
+        else:
+            # With no history, the first point is chosen by acquisition score.
+            normalized_distance = np.ones_like(distances)
+
+        novelty = novelty_floor + (1.0 - novelty_floor) * normalized_distance
+        greedy_scores = base_scores[remaining_idx] * novelty
+        best_local = int(np.argmax(greedy_scores))
+        best_idx = int(remaining_idx[best_local])
+        selected.append(best_idx)
+        remaining[best_idx] = False
+
+        distance_to_selected = np.linalg.norm(
+            candidate_points - candidate_points[best_idx],
+            axis=1,
+        )
+        nearest_occupied_distance = np.minimum(
+            nearest_occupied_distance,
+            distance_to_selected,
+        )
+
+    return np.asarray(selected, dtype=int), initial_history_distances
+
 def safe_cv(std, mean, rel_floor=0.05, abs_floor=1e-12):
     """
     Safe coefficient of variation: CV = std / (abs(mean) + tau), where tau is an adaptive buffer:
@@ -594,8 +716,8 @@ def mix_ratio_from_scores(
     Input: scores may have shape [M], [M, T], or [M, N, T]; values are unnormalized and may be negative.
     Output: a ratio vector with shape [T], or [1, 1, T] when keepdims=True, clipped to [0, 1].
 
-    method='gs'      -> normalized Gini-Simpson: (1 - sum(p^2)) / (1 - 1/M)
-    method='entropy' -> normalized Shannon entropy: H / log(M)
+    method='gs'      -> normalized Gini-Simpson:  (1 - ∑ p^2) / (1 - 1/M)
+    method='entropy' -> normalized Shannon entropy:   H / log(M)
     All-zero columns along M fall back to a uniform distribution and return metric value 1.
     """
     x = np.asarray(scores, dtype=float)
@@ -973,6 +1095,10 @@ class AcquisitionFunction:
                 corr_acq_y_bests = y_value[y_best_indexes]
         
         corr_means, corr_stds, corr_modelstds, ori_scores, exp_ori_scores, struct_scores, clpss, flat_info_dict = {}, {}, {}, {}, {}, {}, {}, {}
+        oob_residual_variances = {
+            model_name: np.full(num_of_targets, np.nan, dtype=float)
+            for model_name in model_name_list
+        }
         # Load models
         for sg_model in model_name_list:
             logging.info(f"--- {sg_model}: Calculating the mean and std of candidates ---")
@@ -1005,6 +1131,9 @@ class AcquisitionFunction:
                     model_elpd_scores = np.clip(np.exp(pack['elpd_per_point_mean'])/np.e, 0, 1)
                     model_clps = pack['crps']
                     sigma_data2 = _read_sigma_data2(pack)
+
+                if sigma_data2 is not None:
+                    oob_residual_variances[sg_model][target_i] = sigma_data2
 
                 if stack:
                     model_inter_score = stacking_scores[target_i][sg_model]
@@ -1045,48 +1174,28 @@ class AcquisitionFunction:
                         # batch_results, e.g., [(preds_batch1, uncert_batch1), (preds_batch2, uncert_batch2), ...]
                         batch_results = ray.get(tasks_for_one_model)
                     
-                        if sg_model == 'GP_gpu':
-                            full_preds = np.concatenate([res[0] for res in batch_results])
-                            full_uncertains = np.concatenate([res[1] for res in batch_results])
-                            results.append((full_preds, full_uncertains))
-                        else:
-                            full_preds = np.concatenate([res[0] for res in batch_results])
-                            results.append((full_preds, None))
+                        full_preds = np.concatenate([res[0] for res in batch_results])
+                        full_internal_variances = np.concatenate([res[1] for res in batch_results])
+                        results.append((full_preds, full_internal_variances))
                 
-                preds = []
-                uncertains = []
-                for res in results:
-                    if sg_model == 'GP_gpu':
-                        preds.append(res[0])
-                        uncertains.append(res[1])
-                    else:
-                        preds.append(res[0])
-                
-                preds = np.array(preds)
-                if sg_model == 'GP_gpu':
-                    uncertains = np.array(uncertains)
-                    mean = preds.mean(axis=0).reshape(-1)
-                    std_raw = uncertains.mean(axis=0).reshape(-1)
-                else:
-                    mean = preds.mean(axis=0).reshape(-1)
-                    std_raw = preds.std(axis=0).reshape(-1)+ 1e-8
-                
-                # ---- Record each model/target floor so it can be subtracted when computing K later. ----
-                if 'data_noise_floor' not in locals():
-                    data_noise_floor = {m: np.zeros(num_of_targets, dtype=float) for m in model_name_list}
-                if (sigma_data2 is not None) and np.isfinite(sigma_data2) and (sigma_data2 > 0):
-                    data_noise_floor[sg_model][target_i] = float(sigma_data2)
-                else:
-                    data_noise_floor[sg_model][target_i] = 0.0
+                preds = np.asarray([res[0] for res in results], dtype=float)
+                internal_variances = np.asarray([res[1] for res in results], dtype=float)
+                mean, model_variance, within_variance, between_variance = aggregate_bootstrap_model_variance(
+                    preds,
+                    internal_variances,
+                )
+                mean = mean.reshape(-1)
+                std_raw = np.sqrt(np.maximum(model_variance, 0.0)).reshape(-1)
+                std = std_raw
+
                 logging.info(
-                    "noise_floor[%s][%s]: sigma_data2=%s, std_raw_max=%.4g",
+                    "model_uncertainty[%s][%s]: within_max=%.4g, between_max=%.4g, total_std_max=%.4g",
                     sg_model,
                     target_i,
-                    f"{float(sigma_data2):.4g}" if sigma_data2 is not None and np.isfinite(sigma_data2) else "None",
+                    float(np.max(within_variance)),
+                    float(np.max(between_variance)),
                     float(np.max(std_raw)),
                 )
-
-                std = np.sqrt(std_raw**2 + data_noise_floor[sg_model][target_i])
 
                 logging.info(f"--- start structure_score calculation ---")
                 structure_score, s_detail = compute_structure_with_rigidity(mean, cand_Z, cand_Zidx_pc1, cand_Zidx_pc2)
@@ -1151,10 +1260,21 @@ class AcquisitionFunction:
         ### ----------- KF needed means and stds ----------- ### 
         # all_sg_pred_stds = np.array([1/(corr_stds[i]**2) for i in model_name_list])  ### normal KF_std
         # reverse_all_sg_pred_stds = np.array([(corr_stds[i]**2) for i in model_name_list])  ### reverse KF_std
-        all_sg_pred_stds = np.array([1/(corr_modelstds[i]**2) for i in model_name_list])  ### normal KF_std
-        reverse_all_sg_pred_stds = np.array([(corr_modelstds[i]**2) for i in model_name_list])  ### reverse KF_std
-        std_weights = all_sg_pred_stds/np.sum(all_sg_pred_stds, axis=0)
-        reverse_std_weights = reverse_all_sg_pred_stds/np.sum(reverse_all_sg_pred_stds, axis=0)
+        reverse_all_sg_pred_stds = np.array([(corr_modelstds[i]**2) for i in model_name_list])
+        oob_residual_variance_array = np.array(
+            [oob_residual_variances[i] for i in model_name_list]
+        )
+        R_model, p_reference, oob_valid = calibrate_oob_noise_variance(
+            reverse_all_sg_pred_stds,
+            oob_residual_variance_array,
+            eps=eps,
+        )
+        std_weights, reverse_std_weights, model_kalman_gain, total_error_variances = kalman_fusion_weights(
+            reverse_all_sg_pred_stds,
+            R_model,
+            shrinkage=0.1,
+            eps=eps,
+        )
         KF_all_sg_values = all_sg_values*std_weights
         reverse_KF_all_sg_values = all_sg_values*reverse_std_weights
 
@@ -1227,25 +1347,33 @@ class AcquisitionFunction:
         if data_level_control:
             # ----------- data level ratio ----------- #    
             P_pred_ens = reverse_all_sg_pred_stds
-            floors = np.stack([data_noise_floor[m] for m in model_name_list], axis=0)  # [M, T]
-            R_eff = np.maximum(np.expand_dims(floors, axis=1), eps)              # [M, T]
+            R_eff = R_model
+            K = model_kalman_gain
 
         else:
             # ----------- acq_KF top level ratio ----------- #    
-            P_pred_ens = np.var(reverse_all_sg_pred_stds, axis=(0,1))
-            floors = np.stack([data_noise_floor[m] for m in model_name_list], axis=0)  # [M, T]
-            R_eff = np.maximum(np.mean(floors, axis=0), eps)                       # [T]
+            P_pred_ens = np.mean(reverse_all_sg_pred_stds, axis=(0,1))
+            R_eff = np.mean(R_model, axis=(0,1))
+            K = np.divide(
+                P_pred_ens,
+                P_pred_ens + R_eff,
+                out=np.zeros_like(P_pred_ens),
+                where=(P_pred_ens + R_eff) > 0.0,
+            )
         logging.info(
             "\n".join([
+                _format_array_for_log("oob_residual_variances", oob_residual_variance_array),
+                _format_array_for_log("candidate_P_reference", p_reference),
+                _format_array_for_log("oob_valid", oob_valid),
                 _format_array_for_log("reverse_all_sg_pred_stds", reverse_all_sg_pred_stds),
                 _format_array_for_log("P_pred_ens", P_pred_ens),
-                _format_array_for_log("floors", floors),
                 _format_array_for_log("R_eff", R_eff),
+                _format_array_for_log("P_plus_R", total_error_variances),
+                _format_array_for_log("K", K),
             ])
         )
     
-        # Normalized Kalman gain over candidates and targets.
-        K = P_pred_ens / (P_pred_ens + R_eff)   # in (0,1) lower the K, the lower the model_std, when model consensus is high, we trust acquisition-driven exploration less because KF emphasizes consensus.
+        # beta = R / (P + R): observation noise relative to model uncertainty.
         beta = np.clip(1-K, 0.0, 1.0)  # How much we trust the model consensus.
 
         logging.info(
@@ -1571,7 +1699,7 @@ class AcquisitionFunction:
             )
             metreics_Xtrain = X_train[bootstrap_train_indices]
             
-        metrics = estimate_density_and_spread(X_new=X_candidate[_next_indexes[:min(max(batch_size*2, 20), len(_next_indexes))]], X_train=X_train, y_new=None)
+        metrics = estimate_density_and_spread(X_new=X_candidate[_next_indexes[:min(max(batch_size*2, 20), len(_next_indexes))]], X_train=metreics_Xtrain, y_new=None)
         logging.info(
             "metrics: LDR=%.4g, coverage=%.4g, KL=%.4g",
             metrics.get("LDR", -np.inf),
@@ -1583,22 +1711,52 @@ class AcquisitionFunction:
         else:
             activate_diversity = False
         
-        screen_X_candidate = X_candidate[_next_indexes]#.astype(np.float32)
+        screen_X_candidate = X_candidate[_next_indexes]
+        logging.info("start final sort")
         if diversity_method and activate_diversity:
             logging.info(
-                "need diversity, start clsustering sort, screen_X_candidate_shape=%s",
+                "need diversity, start clustering/history-aware sort, "
+                "screen_X_candidate_shape=%s",
                 screen_X_candidate.shape,
             )
-            Clustersampler = ClusterBootstrapSampler(batch_size=batch_size, enable_umap=False)
-            labels = Clustersampler.compute_bootstrap_probabilities_clustering(screen_X_candidate, enable_refine=True)
-            diversity_probs = Clustersampler.compute_bootstrap_probabilities_prob(labels, combined_acq[_next_indexes])
-            sort_result = combined_acq[_next_indexes] * diversity_probs
+            Clustersampler = ClusterBootstrapSampler(
+                batch_size=batch_size,
+                enable_umap=False,
+            )
+            labels = Clustersampler.compute_bootstrap_probabilities_clustering(
+                screen_X_candidate,
+                enable_refine=True,
+            )
+            diversity_probs = Clustersampler.compute_bootstrap_probabilities_prob(
+                labels,
+                combined_acq[_next_indexes],
+            )
+            base_diversity_scores = (
+                combined_acq[_next_indexes] * diversity_probs
+            )
+            selected_local, history_distances = select_history_aware_diverse_batch(
+                screen_X_candidate,
+                base_diversity_scores,
+                batch_size=batch_size,
+                X_history=X_train,
+            )
+            finite_history_distances = history_distances[
+                np.isfinite(history_distances)
+            ]
+            if finite_history_distances.size:
+                logging.info(
+                    "history novelty distance: min=%.4g, median=%.4g, max=%.4g",
+                    float(np.min(finite_history_distances)),
+                    float(np.median(finite_history_distances)),
+                    float(np.max(finite_history_distances)),
+                )
+            next_indexes = _next_indexes[selected_local]
         else:
-            logging.info(f"no diversity needed, skip clsustering sort")
+            logging.info("no diversity needed, skip clustering/history-aware sort")
             sort_result = combined_acq[_next_indexes]
-        
-        logging.info(f"start final sort")
-        next_indexes = _next_indexes[np.argsort(sort_result)[::-1][:batch_size]]
+            next_indexes = _next_indexes[
+                np.argsort(sort_result)[::-1][:batch_size]
+            ]
         
         return next_indexes
         
@@ -1616,27 +1774,28 @@ class AcquisitionFunction:
         for model in Mainmodel_train:
             tasks.append(model_predict.remote(model, X_candidate_ref, sg_model=None, start=0, end=len(X_candidate)))
 
-            # make prediction using all bootstrapping generated models to get mean and std
-            results = ray.get(tasks)
-            preds = []
-            for res in results:
-                preds.append(res[0])
+        # Aggregate internal posterior variance and between-bootstrap variance.
+        results = ray.get(tasks)
+        preds = np.asarray([res[0] for res in results], dtype=float)
+        internal_variances = np.asarray([res[1] for res in results], dtype=float)
+        mean, model_variance, _, _ = aggregate_bootstrap_model_variance(
+            preds,
+            internal_variances,
+        )
+        mean = mean.reshape(-1)
+        std = np.sqrt(np.maximum(model_variance, 0.0)).reshape(-1)
 
-            preds = np.array(preds)
-            mean = preds.mean(axis=0).reshape(-1)
-            std = preds.std(axis=0).reshape(-1)
-            
-            if method == 'ucb':
-                acq_value = self.ucb(mean, std)
-            elif method == 'ei' or method == 'pi':
-                if y_best is None:
-                    raise ValueError(f"Unknown current best target value y_best, add current best target value if you want to use EI or PI")
-                if method == 'ei':
-                    acq_value = self.ei(mean, std, y_best)
-                elif method == 'pi':
-                    acq_value = self.pi(mean, std, y_best)
-            else:
-                raise ValueError(f"Unknown acquisition method: {method}")
+        if method == 'ucb':
+            acq_value = self.ucb(mean, std)
+        elif method == 'ei' or method == 'pi':
+            if y_best is None:
+                raise ValueError(f"Unknown current best target value y_best, add current best target value if you want to use EI or PI")
+            if method == 'ei':
+                acq_value = self.ei(mean, std, y_best)
+            elif method == 'pi':
+                acq_value = self.pi(mean, std, y_best)
+        else:
+            raise ValueError(f"Unknown acquisition method: {method}")
         sort_result = acq_value.reshape(-1)
         
         next_indexes = np.argsort(sort_result)[::-1][:batch_size]
@@ -1682,28 +1841,25 @@ class AcquisitionFunction:
                 score_mu, score_std = np.mean(model_errors), np.std(model_errors)
                 model_score = np.clip(score_mu-0.01*score_std, 0, np.inf)
 
-            # make prediction using all bootstrapping generated models to get mean and std
+            # Aggregate internal posterior variance and between-bootstrap variance.
             preds = []
-            uncertains = []
+            internal_variances = []
             for model in models:
-                ### for GP_gpu models
-                if sg_model == 'GP_gpu':
-                    Gmodel_res = model.model.posterior(torch.tensor(X_candidates, dtype=torch.float32))
-                    Gmean = Gmodel_res.mean.detach().cpu().numpy().reshape(-1)
-                    Gstd = torch.sqrt(Gmodel_res.variance).detach().cpu().numpy().reshape(-1)
-                    preds.append(Gmean)
-                    uncertains.append(Gstd)
-                else:
-                    preds.append(model.predict(X_candidates))
-            preds = np.array(preds)
-
-            if sg_model == 'GP_gpu':
-                uncertains = np.array(uncertains)
-                mean = preds.mean(axis=0).reshape(-1)
-                std = uncertains.mean(axis=0).reshape(-1)
-            else:
-                mean = preds.mean(axis=0).reshape(-1)
-                std = preds.std(axis=0).reshape(-1)            
+                pred, internal_variance = predict_mean_and_internal_variance(
+                    model,
+                    X_candidates,
+                    model_name=sg_model,
+                )
+                preds.append(pred)
+                if internal_variance is None:
+                    internal_variance = np.zeros_like(pred, dtype=float)
+                internal_variances.append(internal_variance)
+            mean, model_variance, _, _ = aggregate_bootstrap_model_variance(
+                np.asarray(preds, dtype=float),
+                np.asarray(internal_variances, dtype=float),
+            )
+            mean = mean.reshape(-1)
+            std = np.sqrt(np.maximum(model_variance, 0.0)).reshape(-1)
             weighted_mean = mean*model_score
             weighted_std = std*model_score
             cmean.append(weighted_mean)

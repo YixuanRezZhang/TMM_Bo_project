@@ -111,6 +111,13 @@ def estimate_budget(
     lambda_unsup=1.0,
     growth="loglinear",
 ):
+    if (
+        isinstance(max_cap, (bool, np.bool_))
+        or not isinstance(max_cap, numbers.Integral)
+        or max_cap <= 0
+    ):
+        raise ValueError("max_cap must be a positive integer.")
+    max_cap = int(max_cap)
 
     _, unique_idx = np.unique(X_ori, axis=0, return_index=True)
     X = X_ori[sorted(unique_idx)]
@@ -153,7 +160,7 @@ def estimate_budget(
 
     
     logging.info("estimate_budget dims: unsup=%s, sup=%s, est=%s", d_unsup, d_sup, d_est)
-    # Alternative effective dimension rule: max(d_sup, lambda_unsup*d_unsup, d_mle).
+    # d_eff = max(d_sup, int(lambda_unsup * d_unsup), d_mle)
     d_eff = int((d_sup + d_est + lambda_unsup * d_unsup)/3)
     d_all = d_sup+d_unsup+d_est
 
@@ -398,17 +405,19 @@ def hyperparameter_optimization(
     cv_n_splits=5,
     alpha=0.2,
     expect_N: int=3,
-    eta: int=3
+    eta: int=3,
+    max_cap=None,
 ):
     
     n_samples, feature_dim = X_train.shape
     target_dim = 1 if y_train.ndim == 1 else y_train.shape[1]
 
     # The budget is adaptively provided by estimate_budget.
-    max_resource, d_eff, d_all = estimate_budget(X_train, y_train)   # 1 ≤ resource ≤ max_resource
+    budget_kwargs = {} if max_cap is None else {'max_cap': max_cap}
+    max_resource, d_eff, d_all = estimate_budget(
+        X_train, y_train, **budget_kwargs
+    )   # 1 ≤ resource ≤ max_resource
     logging.info(f'{model_name} max_resource: {max_resource}')
-    if max_resource < 10:          # Guard for very small datasets.
-        max_resource = 10
     ratio_global = min(n_samples / max_resource, 1.0)
 
     # pruner = HyperbandPruner(min_resource=10,max_resource=max_resource,reduction_factor=eta)

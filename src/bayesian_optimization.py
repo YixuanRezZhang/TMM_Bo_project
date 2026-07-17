@@ -22,23 +22,27 @@ logging.basicConfig(
     # level=logging.DEBUG
 )
 
-def _make_ray_temp_dir():
-    """Create a per-process Ray temp directory with no host-specific paths."""
-    candidates = [
+def _candidate_ray_temp_dirs():
+    """Create candidate per-process Ray temp directories without host-specific paths."""
+    base_candidates = [
         os.path.join(os.getcwd(), "tmp"),
         tempfile.gettempdir(),
     ]
+    candidates = []
     last_error = None
-    for base_dir in candidates:
+    for base_dir in base_candidates:
         try:
             os.makedirs(base_dir, exist_ok=True)
             ray_temp_dir = os.path.join(base_dir, f"ray_{os.getpid()}")
             os.makedirs(ray_temp_dir, exist_ok=True)
-            return ray_temp_dir
+            if ray_temp_dir not in candidates:
+                candidates.append(ray_temp_dir)
         except OSError as exc:
             last_error = exc
             logging.warning("Cannot create Ray temp directory under %s: %s", base_dir, exc)
-    raise RuntimeError("Unable to create a Ray temp directory") from last_error
+    if not candidates:
+        raise RuntimeError("Unable to create a Ray temp directory") from last_error
+    return candidates
 
 
 def cleanup_ray_runtime(ray_temp_dir=None):
@@ -56,64 +60,106 @@ def cleanup_ray_runtime(ray_temp_dir=None):
 
 def initialize_ray():
     # Check total system memory.
-    total_memory = psutil.virtual_memory().total  # Total system memory.
+    total_memory = psutil.virtual_memory().total
     logging.info(f"Total system memory: {total_memory / (1024**3):.2f} GB")
 
     # Check total and available space in /dev/shm.
     shm_stats = psutil.disk_usage('/dev/shm')
-    shm_total = shm_stats.total  # Total shared-memory size.
-    shm_available = shm_stats.free  # Available shared-memory space.
+    shm_total = shm_stats.total
+    shm_available = shm_stats.free
     virtual_num_cpus = psutil.cpu_count(logical=False)
     logging.info(f"Available CPUs: {virtual_num_cpus}")
     logging.info(f"/dev/shm total size: {shm_total / (1024**3):.2f} GB")
     logging.info(f"/dev/shm available size: {shm_available / (1024**3):.2f} GB")
 
-    ray_temp_dir = _make_ray_temp_dir()
+    ray_temp_dirs = _candidate_ray_temp_dirs()
 
     # Detect whether initialization is running under SLURM.
     if os.environ.get('SLURM_JOB_ID') is not None:
         logging.info('SLURM environment detected.')
-        
-        # Read resources allocated by SLURM.
-        num_cpus = min(int(os.environ.get('SLURM_JOB_CPUS_PER_NODE')), int(os.environ.get('SLURM_NTASKS', 1)) * int(os.environ.get('SLURM_CPUS_PER_TASK', 1)))
-        memory_per_cpu = int(os.environ.get('SLURM_MEM_PER_CPU')) * 1024 * 1024  # Unit: bytes.
-        total_slurm_memory = num_cpus * memory_per_cpu
 
-        total_slurm_memory = min(total_slurm_memory, int(total_memory))
+        # Read resources allocated by SLURM.
+        num_cpus = min(
+            int(os.environ.get('SLURM_JOB_CPUS_PER_NODE')),
+            int(os.environ.get('SLURM_NTASKS', 1)) * int(os.environ.get('SLURM_CPUS_PER_TASK', 1)),
+        )
+        memory_per_cpu = int(os.environ.get('SLURM_MEM_PER_CPU')) * 1024 * 1024
+        total_slurm_memory = min(num_cpus * memory_per_cpu, int(total_memory))
         object_store_memory = int(min(shm_available * 0.5, total_slurm_memory))
         num_cpus = min(num_cpus, virtual_num_cpus)
 
-        logging.info(f"SLURM INFO: num_cpus={num_cpus}, memory_per_cpu={memory_per_cpu}, total_memory={total_slurm_memory}")
+        logging.info(
+            f"SLURM INFO: num_cpus={num_cpus}, memory_per_cpu={memory_per_cpu}, total_memory={total_slurm_memory}"
+        )
         logging.info(f"Setting object_store_memory to {object_store_memory / (1024**3):.2f} GB")
-
-        try:
-            cleanup_ray_runtime()
-            ray.init(
-                _temp_dir=ray_temp_dir,
-                _memory=int(object_store_memory),
-                include_dashboard=False,
-                logging_level=logging.INFO,
-            )
-            logging.info("Ray initialized successfully in SLURM mode with temp_dir=%s", ray_temp_dir)
-            return ray_temp_dir
-        except Exception as e:
-            cleanup_ray_runtime(ray_temp_dir)
-            logging.error(f"Failed to initialize Ray in SLURM environment: {e}")
-            raise
+        init_kwargs = {
+            "_memory": int(object_store_memory),
+            "include_dashboard": False,
+            "logging_level": logging.INFO,
+        }
+        mode_name = "SLURM"
     else:
         logging.info('No SLURM environment detected. Initializing Ray locally.')
+        init_kwargs = {
+            "include_dashboard": False,
+            "logging_level": logging.INFO,
+        }
+        mode_name = "local"
+
+    last_error = None
+    for ray_temp_dir in ray_temp_dirs:
         try:
             cleanup_ray_runtime()
-            ray.init(_temp_dir=ray_temp_dir, include_dashboard=False, logging_level=logging.INFO)
-            logging.info("Ray initialized successfully in local mode with temp_dir=%s", ray_temp_dir)
+            ray.init(_temp_dir=ray_temp_dir, **init_kwargs)
+            logging.info(
+                "Ray initialized successfully in %s mode with temp_dir=%s",
+                mode_name,
+                ray_temp_dir,
+            )
             return ray_temp_dir
-        except Exception as e:
+        except Exception as exc:
+            last_error = exc
             cleanup_ray_runtime(ray_temp_dir)
-            logging.error(f"Failed to initialize Ray in local environment: {e}")
-            raise
+            logging.warning(
+                "Failed to initialize Ray in %s mode with temp_dir=%s: %s",
+                mode_name,
+                ray_temp_dir,
+                exc,
+            )
+
+    try:
+        cleanup_ray_runtime()
+    except Exception as exc:
+        logging.warning("Ray shutdown after failed initialization also failed: %s", exc)
+    logging.error("Failed to initialize Ray in %s mode with all candidate temp dirs.", mode_name)
+    raise RuntimeError(
+        f"Failed to initialize Ray in {mode_name} mode with all candidate temp dirs."
+    ) from last_error
 
 class BayesianOptimization:
-    def __init__(self, target_props, data_file=None, feature_props=None, drop_columns=None, optimization_goal='maximize', scaler_method='standard', model_list=None, model_path=f'{os.getcwd()}/model_weights', stacking=False, cross_val=False, acq_method='ucb', feature_lb=None, feature_ub=None, candidate_file=None, close_pool=False, close_pool_initial_samples=10, close_pool_threshold=None, select_region=None, uni_hyperparameter=False):
+    def __init__(
+        self,
+        target_props,
+        data_file=None,
+        feature_props=None,
+        drop_columns=None,
+        optimization_goal='maximize',
+        scaler_method='standard',
+        model_list=None,
+        model_path=f'{os.getcwd()}/model_weights',
+        stacking=False,
+        cross_val=False,
+        acq_method='ucb',
+        feature_lb=None,
+        feature_ub=None,
+        candidate_file=None,
+        close_pool=False,
+        close_pool_initial_samples=10,
+        close_pool_threshold=None,
+        select_region=None,
+        uni_hyperparameter=False,
+        max_cap=None,
+    ):
         self.data_file = data_file
         self.target_props = sorted(target_props)
         self.feature_props = feature_props
@@ -136,6 +182,17 @@ class BayesianOptimization:
         logging.info("target_props=%s, select_region=%s", self.target_props, self.select_region)
         self.feature_bounds = [feature_lb, feature_ub] if feature_lb is not None and feature_ub is not None else None
         self.uni_hyperparameter = uni_hyperparameter
+        if (
+            max_cap is not None
+            and (
+                isinstance(max_cap, (bool, np.bool_))
+                or not isinstance(max_cap, (int, np.integer))
+                or max_cap <= 0
+            )
+        ):
+            raise ValueError("max_cap must be None or a positive integer.")
+        self.max_cap = None if max_cap is None else int(max_cap)
+        logging.info("Configured max_cap=%s", self.max_cap)
 
         try:
             self.ray_temp_dir = initialize_ray()
@@ -177,7 +234,7 @@ class BayesianOptimization:
                 # Compute the product of each normalized target row.
                 product = np.prod(normalized_y, axis=1)
                 indexes = np.argsort(product)
-                select_index = max(int(len(product) * 0.99), len(product)-10)
+                select_index = max(int(len(product) * 0.99), len(product)-5)
                 select_index_init = int(len(product) * 0.5)
 
                 # Compute the threshold.
@@ -193,7 +250,7 @@ class BayesianOptimization:
                 normalized_y = (self.y - self.min_vals) / self.ranges
                 product = np.prod(normalized_y, axis=1)
                 indexes = np.argsort(product)
-                select_index = max(int(len(product) * 0.99), len(product)-3)
+                select_index = max(int(len(product) * 0.99), len(product)-10)
                 select_index_init = int(len(product) * 0.5)
 
                 # Compute the threshold.
@@ -202,6 +259,25 @@ class BayesianOptimization:
                 self.data_index = indexes
                 self.close_pool_init_threshold = product[indexes][select_index_init]
 
+    def _resolve_budget_max_cap(self, batch_size=None, n_iter=None):
+        if self.max_cap is not None:
+            logging.info("Using explicit max_cap=%s.", self.max_cap)
+            return self.max_cap
+        if batch_size is not None and n_iter is not None:
+            automatic_cap = int(batch_size) * int(n_iter)
+            if automatic_cap <= 0:
+                raise ValueError(
+                    "batch_size * n_iter must be positive when deriving max_cap."
+                )
+            logging.info(
+                "No explicit max_cap; using batch_size * n_iter = %s.",
+                automatic_cap,
+            )
+            return automatic_cap
+        logging.info(
+            "No explicit max_cap; using estimate_budget's default cap."
+        )
+        return None
 
     def cleanup_runtime(self):
         cleanup_ray_runtime(getattr(self, 'ray_temp_dir', None))
@@ -235,8 +311,15 @@ class BayesianOptimization:
     def close_pooling_test(self, n_bootstrap_sample_nums=20, n_iter=100, batch_size=10, hpar=0.1, save_all_info=True, sampling_method='genetic_algorithm', num_candidate=100, n_samples=200, iterations=30, candidate_sampling=False, diversity_method=False, use_data_correlation=False, use_model_correlation=False):
         
         logging.info(f'Threshold is {self.close_pool_threshold}, init_sampling threshold is {self.close_pool_init_threshold}')
+        budget_max_cap = self._resolve_budget_max_cap(
+            batch_size=batch_size, n_iter=n_iter
+        )
 
-        iter_info = os.popen(f'tail -1 ./performance_record.txt').read()
+        iter_info = ''
+        if os.path.exists('./performance_record.txt'):
+            with open('./performance_record.txt', 'r') as performance_file:
+                for line in performance_file:
+                    iter_info = line
         if 'iter_num' not in iter_info and os.path.exists(f'./model_weights/0'):
             iteration = max([int(i) for i in os.listdir(f'./model_weights/') if i.isdigit()])
             logging.info(f'resume from iteration {iteration}')
@@ -280,7 +363,12 @@ class BayesianOptimization:
                 scaled_feature_bounds = None
 
             select_region = self.io_manager.scaler_y.transform(self.select_region) if self.select_region is not None else None
-            model_evaluator = ModelEvaluator(X_scaled, y_scaled, file_path=self.model_path)
+            model_evaluator = ModelEvaluator(
+                X_scaled,
+                y_scaled,
+                file_path=self.model_path,
+                max_cap=budget_max_cap,
+            )
             sampler = Sampler(self.io_manager.scaler_X, scaled_feature_bounds)
             feature_dim = X_scaled.shape[1]
             
@@ -380,6 +468,7 @@ class BayesianOptimization:
                 output_path = os.path.join(self.model_path, 'final_train_data.csv')
                 df_all.to_csv(output_path, index=False)
                 logging.info(f"Final training data saved to {output_path}")
+                self.cleanup_runtime()
                 break
 
         self.cleanup_runtime()
@@ -388,6 +477,7 @@ class BayesianOptimization:
 
         ## initializing
         logging.info('Initialisation')
+        budget_max_cap = self._resolve_budget_max_cap()
         X_train, y_train = self.X, self.y
         
         if self.X_cand is None:
@@ -419,7 +509,13 @@ class BayesianOptimization:
         else:
             scaled_feature_bounds = None
         
-        model_evaluator = ModelEvaluator(X_scaled, y_scaled, file_path=self.model_path, optimization_goal=self.optimization_goal)
+        model_evaluator = ModelEvaluator(
+            X_scaled,
+            y_scaled,
+            file_path=self.model_path,
+            optimization_goal=self.optimization_goal,
+            max_cap=budget_max_cap,
+        )
         feature_dim = X_scaled.shape[1]
         sampler = Sampler(self.io_manager.scaler_X, scaled_feature_bounds)
         acquisition_function = AcquisitionFunction(hpar)

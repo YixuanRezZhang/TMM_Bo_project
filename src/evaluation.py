@@ -8,9 +8,10 @@ from sklearn.linear_model import RidgeCV, LogisticRegression, RidgeClassifier, L
 from sklearn.ensemble import StackingRegressor, StackingClassifier, RandomForestClassifier, GradientBoostingClassifier, RandomForestRegressor, GradientBoostingRegressor
 from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin, clone
 from src.surrogate_model import SurrogateModel, hyperparameter_optimization
+from src.model_uncertainty import predict_mean_and_internal_variance
 from scipy.stats import iqr, mode
 from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
+from sklearn.cluster import HDBSCAN as SklearnHDBSCAN, KMeans
 from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
 from sklearn.metrics import silhouette_score, davies_bouldin_score
 from sklearn.neighbors import KernelDensity
@@ -30,6 +31,12 @@ except ImportError as exc:
     coo_matrix = None
     LEIDEN_IMPORT_ERROR = exc
 
+try:
+    import hdbscan
+except ImportError as exc:
+    hdbscan = None
+    HDBSCAN_IMPORT_ERROR = exc
+
 if torch.cuda.is_available():
     device = torch.device('cuda')
     import cuml, cupy
@@ -37,13 +44,6 @@ if torch.cuda.is_available():
     from cuml.cluster import KMeans as cuKMeans
     from cuml.neighbors import NearestNeighbors as cuKNN
 else:
-    try:
-        import hdbscan
-    except ImportError as exc:
-        hdbscan = None
-        HDBSCAN_IMPORT_ERROR = exc
-    else:
-        HDBSCAN_IMPORT_ERROR = None
     device = torch.device('cpu')
 
 
@@ -55,10 +55,64 @@ def _require_leiden_dependencies():
 
 
 def _require_hdbscan_dependency():
-    if not torch.cuda.is_available() and hdbscan is None:
+    if hdbscan is None:
         raise ImportError(
             "HDBSCAN clustering on CPU requires the optional `hdbscan` package."
         ) from HDBSCAN_IMPORT_ERROR
+
+
+def _prepare_clustering_input(X):
+    """Return a finite, contiguous float32 matrix plus degeneracy diagnostics."""
+    X = np.asarray(X)
+    if X.ndim != 2:
+        raise ValueError(f"Clustering input must be 2-D, got shape {X.shape}.")
+
+    n_rows, n_features = X.shape
+    if n_features == 0:
+        raise ValueError("Clustering input must contain at least one feature.")
+
+    try:
+        X = np.asarray(X, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Clustering input must be numeric.") from exc
+
+    nonfinite_mask = ~np.isfinite(X)
+    nonfinite_values = int(nonfinite_mask.sum())
+    if nonfinite_values:
+        X = X.copy()
+        for column_idx in np.flatnonzero(nonfinite_mask.any(axis=0)):
+            finite_values = X[np.isfinite(X[:, column_idx]), column_idx]
+            fill_value = float(np.median(finite_values)) if finite_values.size else 0.0
+            X[nonfinite_mask[:, column_idx], column_idx] = fill_value
+
+    # Constant dimensions add no clustering information and can make GPU distance
+    # kernels take degenerate paths, especially for very small bootstrap samples.
+    if n_rows:
+        informative_columns = np.ptp(X, axis=0) > 0.0
+    else:
+        informative_columns = np.ones(n_features, dtype=bool)
+    constant_columns = int(n_features - informative_columns.sum())
+    all_features_constant = bool(n_rows and not informative_columns.any())
+    if informative_columns.any():
+        X = X[:, informative_columns]
+    else:
+        # Keep the matrix structurally valid. The caller will short-circuit this
+        # no-information case rather than invoking a clustering implementation.
+        X = np.zeros((n_rows, 1), dtype=np.float64)
+
+    X = np.ascontiguousarray(X, dtype=np.float32)
+    unique_rows = int(np.unique(X, axis=0).shape[0]) if n_rows else 0
+    diagnostics = {
+        'n_rows': n_rows,
+        'original_features': n_features,
+        'kept_features': X.shape[1],
+        'nonfinite_values': nonfinite_values,
+        'constant_columns': constant_columns,
+        'unique_rows': unique_rows,
+        'duplicate_rows': n_rows - unique_rows,
+        'all_features_constant': all_features_constant,
+    }
+    return X, diagnostics
 
 
 def _norm_pdf(z):
@@ -85,7 +139,7 @@ def _gaussian_crps(y, mu, sigma):
     return sigma * (z * (2.0 * Phi - 1.0) + 2.0 * phi - 1.0 / np.sqrt(np.pi))
 
 def _student_t_logpdf(res, s, nu):
-    # res = y - mu; s > 0; nu > 2.
+    # res = y - mu；s>0；nu>2
     s = np.maximum(s, 1e-12)
     const = lgamma((nu + 1.0) / 2.0) - lgamma(nu / 2.0) - 0.5 * np.log(np.pi * nu)
     return const - np.log(s) - 0.5 * (nu + 1.0) * np.log1p((res * res) / (nu * s * s))
@@ -99,7 +153,7 @@ def _sample_student_t(m, n_samples, nu, s, mu, rng=None):
     return mu[:, None] + s[:, None] * T
 
 def _student_t_crps_mc(y, mu, s, nu, n_samples=256, rng=None):
-    """Unbiased Monte Carlo CRPS estimate: E|X - y| - 0.5 * E|X - X'|."""
+    """Unbiased Monte Carlo CRPS estimate: E|X - y| - 0.5 * E|X - X_prime|"""
     S1 = _sample_student_t(len(y), n_samples, nu, s, mu, rng)
     S2 = _sample_student_t(len(y), n_samples, nu, s, mu, rng)
     term1 = np.mean(np.abs(S1 - y[:, None]), axis=1)
@@ -109,7 +163,8 @@ def _student_t_crps_mc(y, mu, s, nu, n_samples=256, rng=None):
 def _get_pred_std_if_available(model, X):
     """
     Return predictive standard deviation when the model supports it; otherwise return None.
-    Priority: predict_std -> predict(return_std=True) -> predict(return_cov=True) -> None.
+    Priority: predict_std -> predict(return_std=True) -> predict(return_cov=True)
+    -> bagging/forest member variance -> None.
     Also tries the wrapped estimator inside SurrogateModel when present.
     """
     import numpy as np, inspect
@@ -138,7 +193,15 @@ def _get_pred_std_if_available(model, X):
         except Exception:
             pass
 
-    # 3) If this is a wrapper, try the underlying estimator.
+    # 3) Internal variance for GP/forest/bagging models. Boosting stages are not treated as samples.
+    try:
+        _, variance = predict_mean_and_internal_variance(model, X)
+        if variance is not None:
+            return np.sqrt(np.maximum(np.asarray(variance, dtype=float), 0.0)).reshape(-1)
+    except Exception:
+        pass
+
+    # 4) If this is a wrapper, try the underlying estimator.
     for attr in ("model", "estimator", "regressor", "base_model"):
         if hasattr(model, attr):
             try:
@@ -146,7 +209,7 @@ def _get_pred_std_if_available(model, X):
             except Exception:
                 pass
 
-    # 4) Give up and let OOB residual estimation handle uncertainty.
+    # 5) Give up and let OOB residual estimation handle uncertainty.
     return None
 
 def _choose_student_t_nu_by_grid(res, sigma, candidates=(2.5,3,4,5,7,10,15,30,1000.0)):
@@ -277,10 +340,22 @@ class AdaptiveClusterer:
     Finds the best clustering configuration from a set of candidates using a 
     scalable 'Compete-and-Select' approach on a data subsample.
     """
-    def __init__(self, batch_size=None, sample_threshold=20000, gpu_available=False):
+    def __init__(
+        self,
+        batch_size=None,
+        sample_threshold=20000,
+        gpu_available=False,
+        use_gpu_hdbscan=False,
+        gpu_hdbscan_min_rows=256,
+    ):
         self.sample_threshold = sample_threshold*4 if gpu_available else sample_threshold
         self.sample_size = sample_threshold*2 if gpu_available else sample_threshold
         self.gpu_available = gpu_available
+        # cuML HDBSCAN may abort the whole Python process from C++/CUDA, so a
+        # Python try/except cannot provide a reliable fallback. Keep it opt-in;
+        # sklearn HDBSCAN is the safe default while other candidates may use GPU.
+        self.use_gpu_hdbscan = bool(use_gpu_hdbscan and gpu_available)
+        self.gpu_hdbscan_min_rows = int(gpu_hdbscan_min_rows)
         
         # Define candidate models and their parameter grids to test
         if self.gpu_available:
@@ -347,13 +422,36 @@ class AdaptiveClusterer:
         chunk_size = 100000
 
         model_name = best_model_info['name']
+        backend = best_model_info.get('backend')
         logging.info(
             "Stage 2: Predicting on %s samples for winning model '%s'",
             n_samples,
             model_name,
         )
 
-        if self.gpu_available:
+        if model_name == 'hdbscan' and backend == 'cpu_sklearn':
+            sample_labels = np.asarray(clusterer_on_sample.labels_, dtype=np.int32)
+            if X_full.shape == X_sample.shape and np.array_equal(X_full, X_sample):
+                logging.info("Reusing sklearn HDBSCAN labels fitted on the full dataset.")
+                return sample_labels.copy()
+
+            n_neighbors = min(10, len(X_sample))
+            logging.info(
+                "sklearn HDBSCAN winner: using CPU k-NN label propagation with k=%s.",
+                n_neighbors,
+            )
+            knn_index = NearestNeighbors(n_neighbors=n_neighbors).fit(X_sample)
+            for i in range(0, n_samples, chunk_size):
+                start, end = i, min(i + chunk_size, n_samples)
+                neighbor_indices = knn_index.kneighbors(
+                    X_full[start:end], return_distance=False
+                )
+                neighbor_labels = sample_labels[neighbor_indices]
+                final_labels[start:end] = mode(
+                    neighbor_labels, axis=1, keepdims=False
+                ).mode
+
+        elif self.gpu_available:
             # --- GPU Prediction Logic ---
             
             # For models without a .predict() method, we use k-NN for label propagation.
@@ -425,6 +523,24 @@ class AdaptiveClusterer:
             final_labels (np.array): The labels for the full dataset X.
             best_model_info (dict): Details of the winning model.
         """
+        X, diagnostics = _prepare_clustering_input(X)
+        logging.info(
+            "Clustering input: rows=%s, unique=%s, duplicate=%s, "
+            "features=%s->%s, repaired_nonfinite=%s.",
+            diagnostics['n_rows'],
+            diagnostics['unique_rows'],
+            diagnostics['duplicate_rows'],
+            diagnostics['original_features'],
+            diagnostics['kept_features'],
+            diagnostics['nonfinite_values'],
+        )
+        if diagnostics['n_rows'] < 2 or diagnostics['unique_rows'] < 2:
+            logging.warning(
+                "Clustering input has fewer than two unique rows; returning all-noise labels."
+            )
+            labels = np.full(diagnostics['n_rows'], -1, dtype=np.int32)
+            return labels, {'name': 'degenerate', 'params': {}, 'backend': 'none'}
+
         # --- Stage 1: Compete on a subsample if the dataset is large ---
         if X.shape[0] > self.sample_threshold:
             logging.info(
@@ -438,49 +554,104 @@ class AdaptiveClusterer:
 
         best_score = -np.inf
         best_model_name, best_params, clusterer_on_sample = None, None, None
+        best_backend = None
         
         if self.gpu_available:
-            from cuml.cluster import HDBSCAN as cuHDBSCAN
-            from cuml.cluster import KMeans as cuKMeans
-            from cuml.neighbors import NearestNeighbors as cuKNN
-            logging.info("GPU execution. Running selection serially on GPU.")
-            X_for_selection_gpu = cupy.asarray(X_for_selection)
+            use_gpu_hdbscan = (
+                self.use_gpu_hdbscan
+                and diagnostics['duplicate_rows'] == 0
+                and diagnostics['nonfinite_values'] == 0
+                and len(X_for_selection) >= self.gpu_hdbscan_min_rows
+            )
+            hdbscan_backend = 'gpu_cuml' if use_gpu_hdbscan else 'cpu_sklearn'
+            logging.info(
+                "GPU execution enabled; HDBSCAN backend=%s, other GPU candidates unchanged.",
+                hdbscan_backend,
+            )
+            if self.use_gpu_hdbscan and not use_gpu_hdbscan:
+                logging.warning(
+                    "Unsafe/degenerate HDBSCAN input detected; falling back from cuML to sklearn."
+                )
+            X_for_selection_gpu = None
             for model_name, param_list in self.candidate_configs.items():
                 for params in param_list:
                     logging.info("Testing %s with params: %s", model_name, params)
-                    labels_gpu, clusterer = None, None
+                    labels, clusterer = None, None
+                    candidate_backend = None
                     if model_name == 'hdbscan':
-                        if len(X_for_selection_gpu) > params['min_samples']:
-                            clusterer = cuHDBSCAN(**params).fit(X_for_selection_gpu)
-                            labels_gpu = clusterer.labels_
+                        if (
+                            len(X_for_selection) >= params['min_cluster_size']
+                            and len(X_for_selection) > params['min_samples']
+                        ):
+                            if use_gpu_hdbscan:
+                                if X_for_selection_gpu is None:
+                                    X_for_selection_gpu = cupy.asarray(X_for_selection)
+                                clusterer = cuHDBSCAN(**params).fit(X_for_selection_gpu)
+                                labels = cupy.asnumpy(clusterer.labels_)
+                            else:
+                                clusterer = SklearnHDBSCAN(
+                                    **params, n_jobs=-1, copy=True
+                                ).fit(X_for_selection)
+                                labels = np.asarray(clusterer.labels_)
+                            candidate_backend = hdbscan_backend
                     elif model_name == 'kmeans':
-                        if len(X_for_selection_gpu) > params['n_clusters']:
-                            clusterer = cuKMeans(n_clusters=params['n_clusters'], init='scalable-k-means++')
+                        if len(X_for_selection) > params['n_clusters']:
+                            if X_for_selection_gpu is None:
+                                X_for_selection_gpu = cupy.asarray(X_for_selection)
+                            clusterer = cuKMeans(
+                                n_clusters=params['n_clusters'],
+                                init='scalable-k-means++',
+                            )
                             clusterer.fit(X_for_selection_gpu)
-                            labels_gpu = clusterer.labels_
+                            labels = cupy.asnumpy(clusterer.labels_)
+                            candidate_backend = 'gpu_cuml'
                     elif model_name == 'leiden':
                         _require_leiden_dependencies()
-                        knn_cuml = cuKNN(n_neighbors=params['k_neighbors'] + 1).fit(X_for_selection_gpu)
+                        if X_for_selection_gpu is None:
+                            X_for_selection_gpu = cupy.asarray(X_for_selection)
+                        knn_cuml = cuKNN(
+                            n_neighbors=params['k_neighbors'] + 1
+                        ).fit(X_for_selection_gpu)
                         D_gpu, I_gpu = knn_cuml.kneighbors(X_for_selection_gpu)
-                        # Graph building and Leiden algorithm run on CPU
                         I_cpu, D_cpu = cupy.asnumpy(I_gpu), cupy.asnumpy(D_gpu)
-                        row, col = np.arange(X_for_selection.shape[0]).repeat(params['k_neighbors']), I_cpu[:, 1:].flatten()
+                        row = np.arange(X_for_selection.shape[0]).repeat(
+                            params['k_neighbors']
+                        )
+                        col = I_cpu[:, 1:].flatten()
                         dist = D_cpu[:, 1:].flatten()
                         mask = dist > 0
                         row, col, dist = row[mask], col[mask], dist[mask]
                         weight = 1.0 / dist
-                        A_sparse = coo_matrix((weight, (row, col)), shape=(X_for_selection.shape[0], X_for_selection.shape[0]))
+                        A_sparse = coo_matrix(
+                            (weight, (row, col)),
+                            shape=(X_for_selection.shape[0], X_for_selection.shape[0]),
+                        )
                         sources, targets = A_sparse.nonzero()
                         g = ig.Graph(edges=list(zip(sources, targets)), directed=False)
                         g.es['weight'] = A_sparse.data
-                        clusterer = leidenalg.find_partition(g, leidenalg.RBConfigurationVertexPartition, weights='weight', resolution_parameter=params['resolution_parameter'])
-                        labels_gpu = cupy.asarray(clusterer.membership)
-                    
-                    score = self._get_validation_score(cupy.asnumpy(X_for_selection_gpu), cupy.asnumpy(labels_gpu))
+                        clusterer = leidenalg.find_partition(
+                            g,
+                            leidenalg.RBConfigurationVertexPartition,
+                            weights='weight',
+                            resolution_parameter=params['resolution_parameter'],
+                        )
+                        labels = np.asarray(clusterer.membership)
+                        candidate_backend = 'hybrid_gpu_cpu'
+
+                    if labels is None:
+                        logging.info(
+                            "  -> Skipped: insufficient samples for this configuration."
+                        )
+                        continue
+                    score = self._get_validation_score(X_for_selection, labels)
                     logging.info("  -> Score: %.4f", score)
 
                     if score > best_score:
-                        best_score, best_model_name, best_params, clusterer_on_sample = score, model_name, params, clusterer
+                        best_score = score
+                        best_model_name = model_name
+                        best_params = params
+                        clusterer_on_sample = clusterer
+                        best_backend = candidate_backend
 
         else: # This is the new parallel CPU logic
             logging.info("CPU execution. Parallelizing search with Ray.")
@@ -489,7 +660,10 @@ class AdaptiveClusterer:
             for model_name, param_list in self.candidate_configs.items():
                 for params in param_list:
                     if model_name == 'hdbscan':
-                        if len(X_for_selection) >  params['min_samples']:
+                        if (
+                            len(X_for_selection) >= params['min_cluster_size']
+                            and len(X_for_selection) > params['min_samples']
+                        ):
                             futures.append(_fit_and_score_cpu.remote(model_name, params, X_ref))
                     elif model_name == "gmm":
                         if len(X_for_selection) > params['n_components']:
@@ -498,8 +672,14 @@ class AdaptiveClusterer:
                         if len(X_for_selection) > params['n_clusters']:
                             futures.append(_fit_and_score_cpu.remote(model_name, params, X_ref))
             
-            results = ray.get(futures)            
-            best_score, best_model_name, best_params = max(results, key=lambda item: item[0])
+            results = ray.get(futures)
+            if results:
+                best_score, best_model_name, best_params = max(
+                    results, key=lambda item: item[0]
+                )
+            else:
+                labels = np.full(X.shape[0], -1, dtype=np.int32)
+                return labels, {'name': 'degenerate', 'params': {}, 'backend': 'none'}
 
             # ✅ ADDED STEP: Perform a final fit on the subsample to get the trained model object
             logging.info("Performing final fit on subsample with winning parameters...")
@@ -507,10 +687,13 @@ class AdaptiveClusterer:
                 _require_hdbscan_dependency()
                 logging.info("Enabling prediction_data for the winning HDBSCAN model.")
                 clusterer_on_sample = hdbscan.HDBSCAN(**best_params, core_dist_n_jobs=-1, prediction_data=True).fit(X_for_selection)
+                best_backend = 'cpu_hdbscan'
             elif best_model_name == 'gmm':
                 clusterer_on_sample = GaussianMixture(**best_params, covariance_type='full').fit(X_for_selection)
+                best_backend = 'cpu_sklearn'
             elif best_model_name == 'kmeans':
                 clusterer_on_sample = KMeans(**best_params, n_init=3).fit(X_for_selection)
+                best_backend = 'cpu_sklearn'
             else:
                 raise ValueError(f"Unsupported model type: {best_model_name}")
             
@@ -524,8 +707,16 @@ class AdaptiveClusterer:
 
         # --- STAGE 2: HYBRID STRATEGY FOR FINAL LABELING ---
         
+        if best_model_name is None:
+            labels = np.full(X.shape[0], -1, dtype=np.int32)
+            return labels, {'name': 'degenerate', 'params': {}, 'backend': 'none'}
+
         final_params = best_params.copy()
-        best_model_info = {'name': best_model_name, 'params': final_params}
+        best_model_info = {
+            'name': best_model_name,
+            'params': final_params,
+            'backend': best_backend,
+        }
 
         if best_model_name == 'leiden':
             _require_leiden_dependencies()
@@ -584,6 +775,9 @@ class ClusterBootstrapSampler:
         high_dim_threshold=10000,
         # ============ GMM parameters, used as fallback or if the logic is extended ==============
         gmm_min_cluster_size=3,
+        # cuML HDBSCAN can terminate the process on CUDA errors. CPU sklearn is
+        # the safe default; explicitly opt in only after validating the RAPIDS stack.
+        use_gpu_hdbscan=False,
     ):
         self.enable_umap = enable_umap
         self.umap_n_min_components = umap_n_min_components
@@ -592,6 +786,7 @@ class ClusterBootstrapSampler:
         self.noise_weight_factor = noise_weight_factor
         self.target_opt = target_opt
         self.gmm_min_cluster_size = gmm_min_cluster_size
+        self.use_gpu_hdbscan = use_gpu_hdbscan
 
     def rescale_features(self, X_scaled):
         n_samples, n_features = X_scaled.shape
@@ -612,7 +807,10 @@ class ClusterBootstrapSampler:
                 logging.info("[Refine] Cluster %s with size %s -> refining...", cid, len(idx))
     
                 X_sub = X[idx]
-                sub_clusterer = AdaptiveClusterer(gpu_available=torch.cuda.is_available())
+                sub_clusterer = AdaptiveClusterer(
+                    gpu_available=torch.cuda.is_available(),
+                    use_gpu_hdbscan=self.use_gpu_hdbscan,
+                )
                 sub_labels, _ = sub_clusterer.find_best_clustering(X_sub)
     
                 sub_unique = np.unique(sub_labels)
@@ -635,15 +833,37 @@ class ClusterBootstrapSampler:
         Performs adaptive clustering and returns the cluster labels.
         This method now uses the AdaptiveClusterer to find the best clustering.
         """
-        # =============== 0. Feature Scaling and GPU Check ===============
-        X_scaled, scale = self.rescale_features(X)
+        # =============== 0. Input Sanitization, Scaling, and GPU Check ===============
+        X_clean, diagnostics = _prepare_clustering_input(X)
+        if diagnostics['nonfinite_values'] or diagnostics['constant_columns']:
+            logging.warning(
+                "Sanitized clustering data: repaired %s non-finite values and "
+                "removed %s constant columns.",
+                diagnostics['nonfinite_values'],
+                diagnostics['constant_columns'],
+            )
+        if diagnostics['duplicate_rows']:
+            logging.warning(
+                "Detected %s duplicate clustering rows; preserving their sampling "
+                "frequency and using the safe HDBSCAN backend.",
+                diagnostics['duplicate_rows'],
+            )
+        if diagnostics['n_rows'] == 0:
+            return np.empty(0, dtype=np.int32)
+        if diagnostics['unique_rows'] < 2:
+            logging.warning(
+                "No meaningful clustering is possible; returning all-noise labels."
+            )
+            return np.full(diagnostics['n_rows'], -1, dtype=np.int32)
+
+        X_scaled, scale = self.rescale_features(X_clean)
         logging.info("Applied dimension related scale factor: %.3f", scale)
 
         gpu_available = torch.cuda.is_available()
         logging.info(f"CUDA available: {gpu_available}")
 
         # Automatically determine if UMAP should be enabled
-        if X.shape[1] >= self.high_dim_threshold:
+        if X_clean.shape[1] >= self.high_dim_threshold:
             self.enable_umap = True
         else:
             self.enable_umap = False
@@ -666,7 +886,11 @@ class ClusterBootstrapSampler:
             X_for_cluster = np.nan_to_num(X_for_cluster)
 
         # =============== 2. Adaptive Clustering via Compete-and-Select ===============
-        adaptive_clusterer = AdaptiveClusterer(batch_size=10, gpu_available=gpu_available)
+        adaptive_clusterer = AdaptiveClusterer(
+            batch_size=10,
+            gpu_available=gpu_available,
+            use_gpu_hdbscan=self.use_gpu_hdbscan,
+        )
         labels, best_model_info = adaptive_clusterer.find_best_clustering(X_for_cluster)
         
         logging.info(f"[AdaptiveClustering] Final model: {best_model_info['name']} with params {best_model_info['params']}")
@@ -780,7 +1004,15 @@ class ClusterBootstrapSampler:
 
 
 class ModelEvaluator:
-    def __init__(self, X_train, y_train, file_path=None, bs_sample_number=None, optimization_goal='maximize'):
+    def __init__(
+        self,
+        X_train,
+        y_train,
+        file_path=None,
+        bs_sample_number=None,
+        optimization_goal='maximize',
+        max_cap=None,
+    ):
         self.X_train = X_train
         self.y_train = y_train
         self.file_path = file_path if file_path is not None else f'{os.getcwd()}/model_weights'
@@ -788,6 +1020,7 @@ class ModelEvaluator:
         prop_bs = int(0.5 * X_train.shape[0])
         self.bs_sample_number = min(X_train.shape[0], 10000) if bs_sample_number is None else bs_sample_number
         self.optimization_goal = optimization_goal
+        self.max_cap = max_cap
         
         self.Clustersampler = ClusterBootstrapSampler(enable_umap=False)
         self.global_labels = self.Clustersampler.compute_bootstrap_probabilities_clustering(self.X_train, enable_refine=True)
@@ -841,7 +1074,9 @@ class ModelEvaluator:
             kf = KFold(n_splits=cv_n_splits, shuffle=True)
             for train_idx, val_idx in kf.split(X_bs):
                 if optimized_params is None or not uni_params:
-                    optimized_params = hyperparameter_optimization(model_name, X_bs, y_bs, cls=cls)
+                    optimized_params = hyperparameter_optimization(
+                        model_name, X_bs, y_bs, cls=cls, max_cap=self.max_cap
+                    )
                 cross_val_tasks.append(self._train_model.remote(self, model_name, optimized_params,
                                                                 X_bs_ref, y_bs_ref, train_idx, cls, use_full_eval))
             results = ray.get(cross_val_tasks)
@@ -924,7 +1159,13 @@ class ModelEvaluator:
                     for i in range(n_bootstrap_sample_nums):
                         bootstrap_indices = np.random.choice(np.arange(n_samples), size=self.bs_sample_number, replace=True)
                         if optimized_params is None or not uni_params:
-                            optimized_params = hyperparameter_optimization(model_name, X_bs[bootstrap_indices], y_bs[bootstrap_indices], cls=cls)
+                            optimized_params = hyperparameter_optimization(
+                                model_name,
+                                X_bs[bootstrap_indices],
+                                y_bs[bootstrap_indices],
+                                cls=cls,
+                                max_cap=self.max_cap,
+                            )
                         bootstrap_tasks.append(self._train_model.remote(self, model_name, optimized_params, X_bs_ref, y_bs_ref, bootstrap_indices, cls, use_full_eval))
                     results = ray.get(bootstrap_tasks)
                 else:
@@ -940,7 +1181,13 @@ class ModelEvaluator:
                         else:
                             bootstrap_indices = np.random.choice(np.arange(n_samples), size=self.bs_sample_number, replace=True)
                         if optimized_params is None or not uni_params:
-                            optimized_params = hyperparameter_optimization(model_name, X_bs[bootstrap_indices], y_bs[bootstrap_indices], cls=cls)
+                            optimized_params = hyperparameter_optimization(
+                                model_name,
+                                X_bs[bootstrap_indices],
+                                y_bs[bootstrap_indices],
+                                cls=cls,
+                                max_cap=self.max_cap,
+                            )
                         bootstrap_tasks.append(self._train_model.remote(self, model_name, optimized_params, X_bs_ref, y_bs_ref, bootstrap_indices, cls, use_full_eval))
                     results = ray.get(bootstrap_tasks)
     
@@ -1162,7 +1409,13 @@ class ModelEvaluator:
                 unihypr_weights /= np.sum(unihypr_weights)
                 indices = np.arange(len(self.X_train))
                 bootstrap_indices = np.random.choice(indices, size=int(len(self.X_train)), replace=True, p=unihypr_weights)
-                optimized_params = hyperparameter_optimization(model_name, self.X_train[bootstrap_indices], self.y_train[:, num_target][bootstrap_indices], cls=cls)
+                optimized_params = hyperparameter_optimization(
+                    model_name,
+                    self.X_train[bootstrap_indices],
+                    self.y_train[:, num_target][bootstrap_indices],
+                    cls=cls,
+                    max_cap=self.max_cap,
+                )
             else:
                 optimized_params = None
 
